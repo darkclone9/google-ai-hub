@@ -580,8 +580,22 @@ interface CanvasRuntimeNode {
   getData(): CanvasFileNodeData;
 }
 
+interface CanvasRuntimeData {
+  nodes: Array<Record<string, unknown> & {
+    id: string;
+    type: string;
+  }>;
+  edges: Array<Record<string, unknown>>;
+}
+
 interface CanvasRuntime {
   nodes: Map<string, CanvasRuntimeNode>;
+  edgeFrom?: {
+    data?: Map<string | CanvasRuntimeNode, unknown>;
+  };
+  getData(): CanvasRuntimeData;
+  getSelectionData(): CanvasRuntimeData;
+  setData(data: CanvasRuntimeData): void | Promise<void>;
   posFromClient(event: MouseEvent): { x: number; y: number };
   createFileNode(options: {
     pos: { x: number; y: number };
@@ -603,6 +617,10 @@ interface CanvasRuntimeView {
 interface CanvasRuntimeContext {
   canvas: CanvasRuntime;
   node: CanvasRuntimeNode;
+}
+
+interface CanvasGoogleDocConnectorAction extends CanvasRuntimeContext {
+  createTabCard(addCardButton: HTMLElement): Promise<void>;
 }
 
 const GOOGLE_DOC_TAB_SUBPATH_PREFIX = "#google-ai-hub-tab=";
@@ -1043,6 +1061,7 @@ export default class GoogleAiHubPlugin extends Plugin {
   googleConnected = false;
   private canvasGoogleDocObserver: MutationObserver | null = null;
   private readonly canvasGoogleDocEmbeds = new Map<CanvasGoogleDocWebview, AbortController>();
+  private readonly canvasGoogleDocConnectorActions = new Map<CanvasRuntimeNode, CanvasGoogleDocConnectorAction>();
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -1150,9 +1169,11 @@ export default class GoogleAiHubPlugin extends Plugin {
 
     this.canvasGoogleDocObserver = new MutationObserver(() => {
       this.refreshCanvasGoogleDocPreviews();
+      this.refreshCanvasGoogleDocConnectorMenus();
     });
     this.canvasGoogleDocObserver.observe(document.body, { childList: true, subtree: true });
     this.refreshCanvasGoogleDocPreviews();
+    this.refreshCanvasGoogleDocConnectorMenus();
   }
 
   private disableCanvasGoogleDocPreviews(): void {
@@ -1169,6 +1190,8 @@ export default class GoogleAiHubPlugin extends Plugin {
       ).forEach(element => element.remove());
     }
     this.canvasGoogleDocEmbeds.clear();
+    this.canvasGoogleDocConnectorActions.clear();
+    document.querySelectorAll(".google-ai-hub-gdoc-connector-add").forEach(element => element.remove());
   }
 
   private refreshCanvasGoogleDocPreviews(): void {
@@ -1183,6 +1206,59 @@ export default class GoogleAiHubPlugin extends Plugin {
     ));
     for (const webview of webviews) {
       this.setupCanvasGoogleDocPreview(webview);
+    }
+  }
+
+  private refreshCanvasGoogleDocConnectorMenus(): void {
+    // Canvas' connector popover uses plain divs in current Obsidian builds,
+    // rather than the button/menu-item elements used by standard menus.
+    const itemSelector = "button, [role='button'], .menu-item, div";
+    const menuItems = Array.from(document.querySelectorAll<HTMLElement>(itemSelector));
+    const exactText = (element: HTMLElement, value: string): boolean =>
+      (element.textContent || "").replace(/\s+/g, " ").trim() === value;
+
+    for (const addCardButton of menuItems.filter(element => exactText(element, "Add card"))) {
+      let menu: HTMLElement | null = addCardButton.parentElement;
+      let addNoteButton: HTMLElement | null = null;
+      for (let depth = 0; menu && menu !== document.body && depth < 6; depth += 1) {
+        addNoteButton = Array.from(menu.querySelectorAll<HTMLElement>(itemSelector))
+          .find(element => exactText(element, "Add note from vault")) || null;
+        if (addNoteButton) break;
+        menu = menu.parentElement;
+      }
+      if (!menu || !addNoteButton || menu.querySelector(".google-ai-hub-gdoc-connector-add")) continue;
+
+      const action = Array.from(this.canvasGoogleDocConnectorActions.values()).find(candidate => {
+        try {
+          const selected = candidate.canvas.getSelectionData().nodes.some(node => node.id === candidate.node.id);
+          if (selected) return true;
+          const connectorSources = candidate.canvas.edgeFrom?.data?.keys();
+          if (!connectorSources) return false;
+          return Array.from(connectorSources).some(source =>
+            (typeof source === "string" ? source : source.id) === candidate.node.id
+          );
+        } catch {
+          return candidate.node.nodeEl?.classList.contains("is-selected") || false;
+        }
+      });
+      if (!action) continue;
+
+      const addTabButton = addCardButton.cloneNode(true) as HTMLElement;
+      addTabButton.classList.add("google-ai-hub-gdoc-connector-add");
+      addTabButton.removeAttribute("disabled");
+      addTabButton.setAttribute("aria-label", "Add Google Doc tab");
+      addTabButton.setAttribute("title", "Create a Google Doc tab and connected Canvas card");
+      addTabButton.textContent = "Add Google Doc tab";
+      addTabButton.addEventListener("pointerdown", event => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
+      addTabButton.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        void action.createTabCard(addCardButton);
+      });
+      addNoteButton.insertAdjacentElement("afterend", addTabButton);
     }
   }
 
@@ -1333,6 +1409,7 @@ export default class GoogleAiHubPlugin extends Plugin {
     const canvasContext = this.findCanvasRuntimeContext(embed);
     const pinnedCanvasTabId = parseGoogleDocTabSubpath(canvasContext?.node.getData().subpath);
     let createTabCardFromDrag: (event: DragEvent, tab: GoogleDocTabInfo) => Promise<void> = async () => {};
+    let createTabCardFromConnector: (addCardButton: HTMLElement) => Promise<void> = async () => {};
     const draftStorageKey = (): string =>
       `google-ai-hub:gdoc-draft:${documentId}:${activeTabId || "document"}`;
 
@@ -1716,6 +1793,90 @@ export default class GoogleAiHubPlugin extends Plugin {
       }
     };
 
+    createTabCardFromConnector = async (addCardButton: HTMLElement): Promise<void> => {
+      if (!nativeTabsAvailable) {
+        new Notice(tabsWarning || "Native Google Doc tabs are not available yet.", 9000);
+        return;
+      }
+      if (!canvasContext) return;
+
+      const sourceTab = tabs.find(tab => tab.id === activeTabId);
+      if (!sourceTab) {
+        new Notice("Choose a Google Doc tab before creating its connected card.", 7000);
+        return;
+      }
+      if (dirty) {
+        await saveDocument(true);
+        if (dirty) return;
+      }
+
+      const canvas = canvasContext.canvas;
+      const sourceData = canvasContext.node.getData();
+      const beforeData = JSON.parse(JSON.stringify(canvas.getData())) as CanvasRuntimeData;
+      const beforeNodeIds = new Set(beforeData.nodes.map(node => node.id));
+
+      addCardButton.click();
+      let placeholderNode: CanvasRuntimeNode | null = null;
+      for (let attempt = 0; attempt < 20 && !placeholderNode; attempt += 1) {
+        placeholderNode = Array.from(canvas.nodes.values())
+          .find(node => !beforeNodeIds.has(node.id)) || null;
+        if (!placeholderNode) {
+          await new Promise<void>(resolve => window.setTimeout(resolve, 25));
+        }
+      }
+      if (!placeholderNode) {
+        new Notice("Obsidian could not create the connected Canvas card.", 8000);
+        return;
+      }
+
+      const restoreCanvas = async (): Promise<void> => {
+        await Promise.resolve(canvas.setData(beforeData));
+        canvas.requestSave();
+      };
+      const editor = await new TabCardEditorModal(this.app, sourceTab.title).openAndWait();
+      if (!editor) {
+        await restoreCanvas();
+        return;
+      }
+
+      setSaveState("Creating tabâ€¦", "saving");
+      try {
+        const createdTabId = await this.driveBridge.addGoogleDocTab(
+          documentId,
+          editor.title,
+          sourceTab.parentTabId,
+          editor.iconEmoji,
+          sourceTab.index + (editor.placement === "below" ? 1 : 0)
+        );
+        if (!createdTabId) throw new Error("Google Docs did not return the new tab ID.");
+
+        const currentData = canvas.getData();
+        const nextNodes = currentData.nodes.map(node => {
+          if (node.id !== placeholderNode.id) return node;
+          const fileNode: Record<string, unknown> & { id: string; type: string } = {
+            ...node,
+            type: "file",
+            file: sourceData.file,
+            subpath: googleDocTabSubpath(createdTabId)
+          };
+          delete fileNode.text;
+          delete fileNode.url;
+          return fileNode;
+        });
+        if (!nextNodes.some(node => node.id === placeholderNode.id && node.type === "file")) {
+          throw new Error("Obsidian could not convert the connected card to a Google Doc tab card.");
+        }
+
+        await Promise.resolve(canvas.setData({ ...currentData, nodes: nextNodes }));
+        canvas.requestSave();
+        new Notice(`Created ${editor.title} ${editor.placement} ${sourceTab.title} in the connected card.`, 8000);
+      } catch (error) {
+        await restoreCanvas();
+        setSaveState(dirty ? "Unsaved draft" : "Saved", dirty ? "dirty" : "saved");
+        new Notice(`Could not create the connected tab card: ${this.errorMessage(error)}`, 10000);
+      }
+    };
+
     const editTab = async (tab: GoogleDocTabInfo): Promise<void> => {
       const editor = await new TabEditorModal(
         this.app,
@@ -2068,6 +2229,19 @@ export default class GoogleAiHubPlugin extends Plugin {
       event.preventDefault();
       void renderDocument();
     }, { signal: controller.signal });
+    if (canvasContext) {
+      const connectorAction: CanvasGoogleDocConnectorAction = {
+        ...canvasContext,
+        createTabCard: addCardButton => createTabCardFromConnector(addCardButton)
+      };
+      this.canvasGoogleDocConnectorActions.set(canvasContext.node, connectorAction);
+      controller.signal.addEventListener("abort", () => {
+        if (this.canvasGoogleDocConnectorActions.get(canvasContext.node) === connectorAction) {
+          this.canvasGoogleDocConnectorActions.delete(canvasContext.node);
+        }
+      }, { once: true });
+      this.refreshCanvasGoogleDocConnectorMenus();
+    }
     void renderDocument();
   }
 
