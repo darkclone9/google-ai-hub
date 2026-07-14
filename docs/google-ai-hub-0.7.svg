@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
+  <title id="title">Google AI Hub 0.7 neutral interface preview</title>
+  <desc id="desc">A sanitized dark-mode preview showing an active document, document AI, NotebookLM Studio tools, and grounded chat.</desc>
+  <defs>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#35353e"/></pattern>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%"><feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#000" flood-opacity=".28"/></filter>
+    <style>
+      .ui { font-family: Inter, Segoe UI, Arial, sans-serif; fill: #e7e7ee; }
+      .muted { fill: #aaaab6; }
+      .small { font-size: 13px; }
+      .body { font-size: 15px; }
+      .heading { font-size: 20px; font-weight: 700; }
+      .button { fill: #292930; stroke: #4b4b56; stroke-width: 1; }
+      .buttonText { font-size: 13px; font-weight: 650; text-anchor: middle; dominant-baseline: middle; }
+      .primary { fill: #7c3aed; stroke: #8b5cf6; }
+      .panel { fill: #222228; stroke: #3d3d47; stroke-width: 1; filter: url(#shadow); }
+    </style>
+  </defs>
+  <rect width="1200" height="760" fill="#17171b"/>
+  <rect x="250" width="950" height="760" fill="url(#dots)"/>
+  <rect width="250" height="760" fill="#202025"/>
+  <line x1="250" y1="0" x2="250" y2="760" stroke="#34343c"/>
+
+  <rect x="20" y="26" width="34" height="34" rx="10" fill="#7c3aed"/>
+  <text x="37" y="49" class="ui" font-size="18" text-anchor="middle">✦</text>
+  <text x="66" y="49" class="ui" font-size="16" font-weight="750">Google AI Hub</text>
+  <rect x="18" y="92" width="214" height="40" rx="8" fill="#30283d"/>
+  <text x="32" y="118" class="ui" font-size="14" fill="#cbb7ff">Research workspace</text>
+  <text x="32" y="163" class="ui muted" font-size="14">NotebookLM</text>
+  <text x="32" y="204" class="ui muted" font-size="14">Gemini</text>
+  <text x="32" y="245" class="ui muted" font-size="14">Google Drive &amp; Docs</text>
+  <text x="32" y="286" class="ui muted" font-size="14">Plugin settings</text>
+
+  <text x="292" y="62" class="ui" font-size="30" font-weight="760">Google AI Hub</text>
+  <text x="292" y="88" class="ui muted body">Research, transform, and discuss the document you are working on.</text>
+  <rect x="1015" y="45" width="145" height="38" rx="8" class="button"/>
+  <text x="1087.5" y="64" class="ui buttonText">Open Google Drive</text>
+
+  <rect x="292" y="116" width="868" height="105" rx="14" class="panel"/>
+  <text x="314" y="145" class="ui muted small" letter-spacing="1.2">ACTIVE SOURCE</text>
+  <text x="314" y="174" class="ui heading">Community Garden Planning</text>
+  <rect x="314" y="185" width="104" height="22" rx="11" fill="#3a2a52"/>
+  <text x="366" y="200" class="ui small" fill="#cdb8ff" text-anchor="middle">Markdown note</text>
+  <text x="428" y="200" class="ui muted small">Demo Notes / Projects / Garden.md · 4,218 characters</text>
+  <rect x="1024" y="148" width="112" height="38" rx="8" class="button"/>
+  <text x="1080" y="167" class="ui buttonText">Choose source</text>
+
+  <rect x="292" y="239" width="425" height="168" rx="14" class="panel"/>
+  <text x="314" y="272" class="ui heading">Document AI</text>
+  <text x="314" y="298" class="ui muted body">Generate grounded results with review-before-write</text>
+  <text x="314" y="320" class="ui muted body">protection.</text>
+  <rect x="314" y="345" width="88" height="38" rx="8" class="button primary"/>
+  <text x="358" y="364" class="ui buttonText">Summary</text>
+  <rect x="412" y="345" width="122" height="38" rx="8" class="button"/>
+  <text x="473" y="364" class="ui buttonText">Briefing report</text>
+  <rect x="544" y="345" width="78" height="38" rx="8" class="button"/>
+  <text x="583" y="364" class="ui buttonText">Shorten</text>
+  <rect x="632" y="345" width="68" height="38" rx="8" class="button"/>
+  <text x="666" y="364" class="ui buttonText">AI ▾</text>
+
+  <rect x="735" y="239" width="425" height="168" rx="14" class="panel"/>
+  <text x="757" y="272" class="ui heading">NotebookLM Studio</text>
+  <text x="757" y="298" class="ui muted body">Load the selected source and focus a Studio workflow.</text>
+  <rect x="757" y="345" width="111" height="38" rx="8" class="button"/>
+  <text x="812.5" y="364" class="ui buttonText">Add as source</text>
+  <rect x="878" y="345" width="91" height="38" rx="8" class="button"/>
+  <text x="923.5" y="364" class="ui buttonText">Mind Map</text>
+  <rect x="979" y="345" width="151" height="38" rx="8" class="button"/>
+  <text x="1054.5" y="364" class="ui buttonText">Audio Overview</text>
+
+  <rect x="292" y="425" width="868" height="280" rx="14" class="panel"/>
+  <text x="314" y="461" class="ui heading">Grounded chat</text>
+  <rect x="314" y="482" width="475" height="64" rx="10" fill="#2b2b32"/>
+  <text x="330" y="504" class="ui small" fill="#c7b5f8" font-weight="700">You</text>
+  <text x="330" y="530" class="ui body">Which decisions still need an owner?</text>
+  <rect x="570" y="562" width="566" height="71" rx="10" fill="#2f293a"/>
+  <rect x="570" y="562" width="3" height="71" rx="2" fill="#8b5cf6"/>
+  <text x="590" y="585" class="ui small" fill="#c7b5f8" font-weight="700">Gemini</text>
+  <text x="590" y="610" class="ui body">The source leaves two decisions open: Saturday watering and the tool-shed permit.</text>
+  <rect x="314" y="653" width="710" height="38" rx="8" fill="#19191e" stroke="#4b4b56"/>
+  <text x="330" y="677" class="ui muted body">Ask about this source...</text>
+  <rect x="1034" y="653" width="102" height="38" rx="8" class="button primary"/>
+  <text x="1085" y="672" class="ui buttonText">Ask</text>
+</svg>

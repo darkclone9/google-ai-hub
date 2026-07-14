@@ -15,6 +15,8 @@ import {
   TFile,
   TFolder,
   WorkspaceLeaf,
+  requestUrl,
+  type Editor,
   type ViewStateResult
 } from "obsidian";
 import TurndownService from "turndown";
@@ -32,8 +34,21 @@ import {
   buildNotebookLmLoaderScript,
   type SourceLoadResult
 } from "./service-loader";
+import {
+  DEFAULT_GEMINI_MODEL,
+  GeminiAiClient,
+  isSourceCurrent,
+  resolveGeminiKey,
+  sourceHash,
+  type AiDocumentSource,
+  type AiResult,
+  type AiWritingAction,
+  type DocumentAiAdapter
+} from "./gemini-ai";
+import { GoogleDocTabSyncRegistry, type GoogleDocTabChange } from "./tab-sync";
 
 const VIEW_TYPE_GOOGLE_AI_HUB = "google-ai-hub-view";
+const GEMINI_SECRET_ID = "google-ai-hub-gemini-api-key";
 
 type ServiceKey = "home" | "notebooklm" | "gemini" | "drive";
 type AiService = "notebooklm" | "gemini";
@@ -46,6 +61,7 @@ interface GoogleAiHubSettings {
   googleCredentialsPath: string;
   googleDocsFolder: string;
   autoSyncGoogleDocs: boolean;
+  geminiModel: string;
   googleDocShortcuts: Record<string, string>;
   noteMirrors: Record<string, NoteMirror>;
   folderMirrors: Record<string, NoteMirror>;
@@ -81,6 +97,10 @@ interface StoredGoogleDocDraft {
   markdown: string;
   updatedAt: number;
 }
+
+type AiDocumentTarget = DocumentAiAdapter;
+
+type AiResultChoice = "replace" | "insert" | "copy" | "regenerate";
 
 class LinkEditorModal extends Modal {
   private resolver: ((result: LinkEditorResult | null) => void) | null = null;
@@ -399,6 +419,115 @@ class DeleteTabModal extends Modal {
   }
 }
 
+class GoogleDocTabPickerModal extends FuzzySuggestModal<GoogleDocTabInfo> {
+  private resolver: ((tab: GoogleDocTabInfo | null) => void) | null = null;
+  private settled = false;
+
+  constructor(app: App, private readonly tabs: GoogleDocTabInfo[]) {
+    super(app);
+    this.setPlaceholder("Choose a Google Doc tab...");
+  }
+
+  openAndWait(): Promise<GoogleDocTabInfo | null> {
+    return new Promise(resolve => {
+      this.resolver = resolve;
+      this.open();
+    });
+  }
+
+  getItems(): GoogleDocTabInfo[] {
+    return this.tabs;
+  }
+
+  getItemText(tab: GoogleDocTabInfo): string {
+    return `${"  ".repeat(tab.nestingLevel)}${tab.iconEmoji ? `${tab.iconEmoji} ` : ""}${tab.title}`;
+  }
+
+  onChooseItem(tab: GoogleDocTabInfo): void {
+    this.finish(tab);
+  }
+
+  onClose(): void {
+    super.onClose();
+    if (!this.settled) this.finish(null, false);
+  }
+
+  private finish(tab: GoogleDocTabInfo | null, close = true): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.resolver?.(tab);
+    this.resolver = null;
+    if (close) this.close();
+  }
+}
+
+class AiResultModal extends Modal {
+  private resolver: ((choice: AiResultChoice | null) => void) | null = null;
+  private settled = false;
+
+  constructor(
+    app: App,
+    private readonly action: AiWritingAction,
+    private readonly original: string,
+    private readonly result: string,
+    private readonly canWrite: boolean
+  ) {
+    super(app);
+  }
+
+  openAndWait(): Promise<AiResultChoice | null> {
+    return new Promise(resolve => {
+      this.resolver = resolve;
+      this.open();
+    });
+  }
+
+  onOpen(): void {
+    this.titleEl.setText(`AI ${this.action === "briefing" ? "briefing report" : this.action}`);
+    this.contentEl.empty();
+    const comparison = this.contentEl.createDiv({ cls: "google-ai-hub-ai-comparison" });
+    for (const [label, value] of [["Original", this.original], ["AI result", this.result]] as const) {
+      const column = comparison.createDiv({ cls: "google-ai-hub-ai-comparison-column" });
+      column.createEl("h3", { text: label });
+      const textarea = column.createEl("textarea", { cls: "google-ai-hub-ai-result-text" });
+      textarea.value = value;
+      textarea.readOnly = true;
+    }
+    if (!this.canWrite) {
+      this.contentEl.createEl("p", {
+        cls: "google-ai-hub-ai-stale-warning",
+        text: "The source changed while AI was working. Copy or regenerate the result; writing it back is disabled to prevent data loss."
+      });
+    }
+    const buttons = this.contentEl.createDiv({ cls: "google-ai-hub-ai-result-actions" });
+    new ButtonComponent(buttons).setButtonText("Cancel").onClick(() => this.finish(null));
+    new ButtonComponent(buttons).setButtonText("Regenerate").onClick(() => this.finish("regenerate"));
+    new ButtonComponent(buttons).setButtonText("Copy").onClick(() => this.finish("copy"));
+    new ButtonComponent(buttons)
+      .setButtonText("Insert below")
+      .setDisabled(!this.canWrite)
+      .onClick(() => this.finish("insert"));
+    new ButtonComponent(buttons)
+      .setButtonText("Replace")
+      .setDisabled(!this.canWrite)
+      .setCta()
+      .onClick(() => this.finish("replace"));
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    if (!this.settled) this.finish(null, false);
+  }
+
+  private finish(choice: AiResultChoice | null, close = true): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.resolver?.(choice);
+    this.resolver = null;
+    if (close) this.close();
+  }
+}
+
 interface InlineStyleState {
   bold: boolean;
   italic: boolean;
@@ -642,9 +771,10 @@ const DEFAULT_SETTINGS: GoogleAiHubSettings = {
   notebookLmUrl: "https://notebooklm.google.com/",
   geminiUrl: "https://gemini.google.com/app",
   driveUrl: "https://drive.google.com/drive/my-drive",
-  googleCredentialsPath: "C:\\Users\\Gary\\Documents\\Astrolysis\\credentials.json",
+  googleCredentialsPath: "C:\\path\\to\\credentials.json",
   googleDocsFolder: "Google Docs",
   autoSyncGoogleDocs: true,
+  geminiModel: DEFAULT_GEMINI_MODEL,
   googleDocShortcuts: {},
   noteMirrors: {},
   folderMirrors: {}
@@ -728,10 +858,61 @@ class VaultItemSuggestModal extends FuzzySuggestModal<TFile | TFolder> {
   }
 }
 
+class AiSourcePickerModal extends FuzzySuggestModal<TFile | TFolder> {
+  private resolver: ((item: TFile | TFolder | null) => void) | null = null;
+  private settled = false;
+
+  constructor(app: App) {
+    super(app);
+    this.setPlaceholder("Choose a Markdown note, folder, or Google Doc...");
+  }
+
+  openAndWait(): Promise<TFile | TFolder | null> {
+    return new Promise(resolve => {
+      this.resolver = resolve;
+      this.open();
+    });
+  }
+
+  getItems(): Array<TFile | TFolder> {
+    return [
+      ...this.app.vault.getAllFolders(false).filter(folder => !folder.path.startsWith(".")),
+      ...this.app.vault.getFiles().filter(file => file.extension === "md" || file.extension === "gdoc")
+    ];
+  }
+
+  getItemText(item: TFile | TFolder): string {
+    return item instanceof TFolder ? `${item.path}/` : item.path;
+  }
+
+  onChooseItem(item: TFile | TFolder): void {
+    this.finish(item);
+  }
+
+  onClose(): void {
+    super.onClose();
+    if (!this.settled) this.finish(null, false);
+  }
+
+  private finish(item: TFile | TFolder | null, close = true): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.resolver?.(item);
+    this.resolver = null;
+    if (close) this.close();
+  }
+}
+
 class GoogleAiHubView extends ItemView {
   private service: ServiceKey = "home";
   private webview: WebviewElement | null = null;
   private webviewReady: Promise<void> | null = null;
+  private aiSource: AiDocumentSource | null = null;
+  private aiSourceInitialized = false;
+  private aiOutput = "";
+  private aiOutputSourceHash = "";
+  private aiBusy = false;
+  private chatHistory: Array<{ role: "user" | "model"; text: string }> = [];
 
   constructor(leaf: WorkspaceLeaf, private readonly plugin: GoogleAiHubPlugin) {
     super(leaf);
@@ -792,6 +973,25 @@ class GoogleAiHubView extends ItemView {
     }
   }
 
+  async focusNotebookLmControl(label: string): Promise<boolean> {
+    if (!this.webview || this.service !== "notebooklm" || label === "source") return label === "source";
+    try {
+      return await this.webview.executeJavaScript(`(() => {
+        const target = ${JSON.stringify(label.toLowerCase())};
+        const elements = Array.from(document.querySelectorAll('button, [role="button"], a'));
+        const control = elements.find(element => (element.textContent || '').trim().toLowerCase().includes(target));
+        if (!control) return false;
+        control.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        control.focus({ preventScroll: true });
+        control.style.outline = '3px solid #8b5cf6';
+        control.style.outlineOffset = '3px';
+        return true;
+      })()`, true) as boolean;
+    } catch {
+      return false;
+    }
+  }
+
   async setState(state: GoogleAiHubViewState, result: ViewStateResult): Promise<void> {
     this.service = isServiceKey(state?.service) ? state.service : "home";
     await super.setState(state, result);
@@ -823,9 +1023,89 @@ class GoogleAiHubView extends ItemView {
   private renderHome(): void {
     const header = this.contentEl.createDiv({ cls: "google-ai-hub-home-header" });
     header.createEl("h1", { text: "Google AI Hub" });
-    header.createEl("p", {
-      text: "NotebookLM, Gemini, Google Drive, and Google Docs in your Obsidian workspace."
+    header.createEl("p", { text: "Research, transform, and discuss the document you are working on." });
+
+    const sourceCard = this.contentEl.createDiv({ cls: "google-ai-hub-active-source" });
+    const sourceHeading = sourceCard.createDiv({ cls: "google-ai-hub-active-source-heading" });
+    sourceHeading.createEl("h2", { text: "Active source" });
+    new ButtonComponent(sourceHeading)
+      .setButtonText("Choose source")
+      .onClick(() => void this.chooseHubSource());
+    if (this.aiSource) {
+      sourceCard.createEl("h3", { text: this.aiSource.title });
+      sourceCard.createEl("p", { text: this.aiSource.description });
+      sourceCard.createEl("small", { text: `${this.aiSource.markdown.length.toLocaleString()} characters` });
+    } else {
+      sourceCard.createEl("p", {
+        text: this.aiSourceInitialized
+          ? "Choose a Markdown note, folder, Google Doc, or Google Doc tab."
+          : "Detecting the active document..."
+      });
+    }
+
+    const research = this.contentEl.createDiv({ cls: "google-ai-hub-research-grid" });
+    const direct = research.createDiv({ cls: "google-ai-hub-research-card" });
+    direct.createEl("h2", { text: "Document AI" });
+    direct.createEl("p", { text: "Generate grounded results without leaving Obsidian." });
+    const directActions = direct.createDiv({ cls: "google-ai-hub-actions" });
+    new ButtonComponent(directActions)
+      .setButtonText("Summary")
+      .setCta()
+      .setDisabled(!this.aiSource || this.aiBusy)
+      .onClick(() => void this.runHubGeneration("summarize"));
+    new ButtonComponent(directActions)
+      .setButtonText("Briefing report")
+      .setDisabled(!this.aiSource || this.aiBusy)
+      .onClick(() => void this.runHubBriefing());
+
+    const notebook = research.createDiv({ cls: "google-ai-hub-research-card" });
+    notebook.createEl("h2", { text: "NotebookLM Studio" });
+    notebook.createEl("p", { text: "Load the source, then focus the Studio workflow you want to use." });
+    const notebookActions = notebook.createDiv({ cls: "google-ai-hub-actions" });
+    for (const [label, control] of [
+      ["Add as source", "source"],
+      ["Mind Map", "mind map"],
+      ["Audio Overview", "audio overview"]
+    ] as const) {
+      new ButtonComponent(notebookActions)
+        .setButtonText(label)
+        .setDisabled(!this.aiSource)
+        .onClick(() => this.aiSource && void this.plugin.openNotebookLmStudio(this.aiSource, control));
+    }
+
+    const chat = this.contentEl.createDiv({ cls: "google-ai-hub-chat" });
+    chat.createEl("h2", { text: "Grounded chat" });
+    const chatLog = chat.createDiv({ cls: "google-ai-hub-chat-log" });
+    if (!this.chatHistory.length) chatLog.createEl("p", { text: "Ask a question about the selected source." });
+    for (const message of this.chatHistory) {
+      const item = chatLog.createDiv({ cls: `google-ai-hub-chat-message is-${message.role}` });
+      item.createEl("strong", { text: message.role === "user" ? "You" : "Gemini" });
+      item.createEl("p", { text: message.text });
+    }
+    const chatForm = chat.createEl("form", { cls: "google-ai-hub-chat-form" });
+    const chatInput = chatForm.createEl("input", { type: "text", placeholder: "Ask about this source..." });
+    chatInput.disabled = !this.aiSource || this.aiBusy;
+    const askButton = chatForm.createEl("button", { text: "Ask", type: "submit" });
+    askButton.disabled = !this.aiSource || this.aiBusy;
+    chatForm.addEventListener("submit", event => {
+      event.preventDefault();
+      const question = chatInput.value.trim();
+      if (question) void this.runHubChat(question);
     });
+
+    if (this.aiOutput) {
+      const output = this.contentEl.createDiv({ cls: "google-ai-hub-output" });
+      output.createEl("h2", { text: "Generated result" });
+      const preview = output.createEl("textarea");
+      preview.value = this.aiOutput;
+      preview.readOnly = true;
+      const outputActions = output.createDiv({ cls: "google-ai-hub-actions" });
+      new ButtonComponent(outputActions).setButtonText("Copy").onClick(() => void navigator.clipboard.writeText(this.aiOutput));
+      new ButtonComponent(outputActions)
+        .setButtonText("Insert")
+        .setDisabled(!this.aiSource?.insert)
+        .onClick(() => void this.insertHubOutput());
+    }
 
     const grid = this.contentEl.createDiv({ cls: "google-ai-hub-card-grid" });
     for (const service of ["notebooklm", "gemini", "drive"] as const) {
@@ -862,6 +1142,77 @@ class GoogleAiHubView extends ItemView {
       .onClick(() => void (this.plugin.googleConnected
         ? this.plugin.syncGoogleDocs()
         : this.plugin.connectGoogleDrive()));
+
+    if (!this.aiSourceInitialized) {
+      this.aiSourceInitialized = true;
+      void this.plugin.getActiveAiSource().then(source => {
+        this.aiSource = source;
+        if (this.service === "home") this.render();
+      });
+    }
+  }
+
+  private async chooseHubSource(): Promise<void> {
+    const source = await this.plugin.chooseAiSource();
+    if (!source) return;
+    this.aiSource = source;
+    this.aiOutput = "";
+    this.aiOutputSourceHash = "";
+    this.chatHistory = [];
+    this.render();
+  }
+
+  private async runHubGeneration(action: AiWritingAction): Promise<void> {
+    if (!this.aiSource || this.aiBusy) return;
+    this.aiBusy = true;
+    this.render();
+    try {
+      const result = await this.plugin.generateForSource(action, this.aiSource);
+      this.aiOutput = result.markdown;
+      this.aiOutputSourceHash = result.sourceHash;
+    } catch (error) {
+      new Notice(`AI request failed: ${error instanceof Error ? error.message : String(error)}`, 10000);
+    } finally {
+      this.aiBusy = false;
+      this.render();
+    }
+  }
+
+  private async runHubBriefing(): Promise<void> {
+    if (!this.aiSource || this.aiBusy) return;
+    await this.plugin.previewSourceAction("briefing", this.aiSource);
+  }
+
+  private async runHubChat(question: string): Promise<void> {
+    if (!this.aiSource || this.aiBusy) return;
+    const source = this.aiSource;
+    this.chatHistory.push({ role: "user", text: question });
+    this.aiBusy = true;
+    this.render();
+    try {
+      const result = await this.plugin.generateForSource("chat", source, question, this.chatHistory.slice(0, -1));
+      this.chatHistory.push({ role: "model", text: result.markdown });
+      this.aiOutput = result.markdown;
+      this.aiOutputSourceHash = result.sourceHash;
+    } catch (error) {
+      new Notice(`Grounded chat failed: ${error instanceof Error ? error.message : String(error)}`, 10000);
+    } finally {
+      this.aiBusy = false;
+      this.render();
+    }
+  }
+
+  private async insertHubOutput(): Promise<void> {
+    if (!this.aiSource?.insert || !this.aiOutput) return;
+    if (this.aiSource.readRevision) {
+      const current = await this.aiSource.readRevision();
+      if (!isSourceCurrent(this.aiOutputSourceHash, current)) {
+        new Notice("The source changed while AI was working. Copy or regenerate the result before inserting it.", 9000);
+        return;
+      }
+    }
+    await this.aiSource.insert(this.aiOutput);
+    new Notice("AI result inserted below the source.", 5000);
   }
 
   private renderService(service: Exclude<ServiceKey, "home">): void {
@@ -981,6 +1332,42 @@ class GoogleAiHubSettingTab extends PluginSettingTab {
     this.addUrlSetting("Gemini URL", "Gemini web application address.", "geminiUrl");
     this.addUrlSetting("Google Drive URL", "Drive location to open by default.", "driveUrl");
 
+    new Setting(containerEl).setName("Gemini document AI").setHeading();
+    containerEl.createEl("p", {
+      text: "Summarize, shorten, lengthen, elaborate, chat with, and report on supported documents. The API key is kept in Obsidian Secret Storage and is never written to plugin data or logs."
+    });
+    const hasGeminiKey = Boolean(this.app.secretStorage.getSecret(GEMINI_SECRET_ID));
+    new Setting(containerEl)
+      .setName("Gemini API key")
+      .setDesc(hasGeminiKey
+        ? "A key is stored securely. Enter a replacement or use Clear to remove it."
+        : "Create a key in Google AI Studio. GEMINI_API_KEY is also accepted during development.")
+      .addText(text => {
+        text.inputEl.type = "password";
+        text.setPlaceholder(hasGeminiKey ? "Stored securely" : "Paste API key")
+          .onChange(value => {
+            const secret = value.trim();
+            if (secret) this.app.secretStorage.setSecret(GEMINI_SECRET_ID, secret);
+          });
+      })
+      .addButton(button => button
+        .setButtonText("Clear")
+        .setDisabled(!hasGeminiKey)
+        .onClick(() => {
+          this.app.secretStorage.setSecret(GEMINI_SECRET_ID, "");
+          this.display();
+        }));
+    new Setting(containerEl)
+      .setName("Gemini model")
+      .setDesc("REST model name used for document AI. The default is the stable Gemini Flash model selected by this plugin release.")
+      .addText(text => text
+        .setPlaceholder(DEFAULT_GEMINI_MODEL)
+        .setValue(this.plugin.settings.geminiModel)
+        .onChange(async value => {
+          this.plugin.settings.geminiModel = value.trim() || DEFAULT_GEMINI_MODEL;
+          await this.plugin.saveSettings();
+        }));
+
     new Setting(containerEl).setName("Google Drive library").setHeading();
     containerEl.createEl("p", {
       text: "Connect once to index and read Drive, edit native Google Docs, and publish selected Obsidian notes. The plugin requests Google Docs edit access, read-only Drive access, and per-file Drive access for documents it creates. The OAuth refresh token is stored outside the synced vault."
@@ -1003,7 +1390,7 @@ class GoogleAiHubSettingTab extends PluginSettingTab {
         .onClick(() => void this.plugin.syncGoogleDocs()));
     new Setting(containerEl)
       .setName("OAuth credentials file")
-      .setDesc("Desktop OAuth client JSON from Google Cloud. The existing Astrolysis credentials file is selected by default.")
+      .setDesc("Path to the desktop OAuth client JSON downloaded from Google Cloud.")
       .addText(text => text
         .setPlaceholder(DEFAULT_SETTINGS.googleCredentialsPath)
         .setValue(this.plugin.settings.googleCredentialsPath)
@@ -1033,7 +1420,7 @@ class GoogleAiHubSettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName("Privacy and credentials").setHeading();
     containerEl.createEl("p", {
-      text: "The plugin never stores your Google password or a Gemini API key. The Drive refresh token is kept in your local AppData folder, not in the synced vault. Google web sign-in remains in Obsidian's embedded session."
+      text: "The plugin never stores your Google password. The Gemini key is kept in Obsidian Secret Storage, and the Drive refresh token is kept in your local AppData folder rather than the synced vault. Document text is sent to Gemini only when you choose an AI action."
     });
   }
 
@@ -1058,6 +1445,8 @@ class GoogleAiHubSettingTab extends PluginSettingTab {
 export default class GoogleAiHubPlugin extends Plugin {
   settings: GoogleAiHubSettings = DEFAULT_SETTINGS;
   driveBridge!: GoogleDriveBridge;
+  geminiAi!: GeminiAiClient;
+  readonly tabSync = new GoogleDocTabSyncRegistry();
   googleConnected = false;
   private canvasGoogleDocObserver: MutationObserver | null = null;
   private readonly canvasGoogleDocEmbeds = new Map<CanvasGoogleDocWebview, AbortController>();
@@ -1066,6 +1455,27 @@ export default class GoogleAiHubPlugin extends Plugin {
   async onload(): Promise<void> {
     await this.loadSettings();
     this.driveBridge = new GoogleDriveBridge(this.app, () => this.settings.googleCredentialsPath);
+    this.geminiAi = new GeminiAiClient(
+      {
+        post: async (url, apiKey, body) => {
+          const response = await requestUrl({
+            url,
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": apiKey
+            },
+            body: JSON.stringify(body)
+          });
+          return response.json;
+        }
+      },
+      () => resolveGeminiKey(
+        this.app.secretStorage.getSecret(GEMINI_SECRET_ID),
+        typeof process !== "undefined" ? process.env.GEMINI_API_KEY : ""
+      ),
+      () => this.settings.geminiModel
+    );
     this.googleConnected = await this.driveBridge.hasStoredToken();
 
     this.registerView(
@@ -1132,6 +1542,23 @@ export default class GoogleAiHubPlugin extends Plugin {
       name: "Publish active note to Google Docs",
       checkCallback: checking => this.publishActiveNote(checking)
     });
+    for (const action of ["summarize", "shorten", "lengthen", "elaborate"] as const) {
+      this.addCommand({
+        id: `ai-${action}-selection-or-note`,
+        name: `AI: ${this.aiActionLabel(action)} selection or note`,
+        editorCallback: (editor, view) => void this.runMarkdownAiAction(action, editor, view)
+      });
+    }
+
+    this.registerEvent(this.app.workspace.on("editor-menu", (menu, editor, view) => {
+      menu.addSeparator();
+      for (const action of ["summarize", "shorten", "lengthen", "elaborate"] as const) {
+        menu.addItem(item => item
+          .setTitle(`AI: ${this.aiActionLabel(action)}`)
+          .setIcon("sparkles")
+          .onClick(() => void this.runMarkdownAiAction(action, editor, view)));
+      }
+    }));
 
     this.registerEvent(this.app.workspace.on("file-menu", (menu, item) => {
       if (!this.isSupportedAiSource(item)) return;
@@ -1147,6 +1574,15 @@ export default class GoogleAiHubPlugin extends Plugin {
         .setTitle(`Use ${sourceType} in NotebookLM`)
         .setIcon("notebook-tabs")
         .onClick(() => void this.prepareItemForService(item, "notebooklm")));
+      if (item instanceof TFile && item.extension === "gdoc") {
+        menu.addSeparator();
+        for (const action of ["summarize", "shorten", "lengthen", "elaborate"] as const) {
+          menu.addItem(menuItem => menuItem
+            .setTitle(`AI: ${this.aiActionLabel(action)} Google Doc tab`)
+            .setIcon("sparkles")
+            .onClick(() => void this.runStandaloneGoogleDocAiAction(action, item)));
+        }
+      }
     }));
 
     this.addSettingTab(new GoogleAiHubSettingTab(this.app, this));
@@ -1161,6 +1597,7 @@ export default class GoogleAiHubPlugin extends Plugin {
 
   onunload(): void {
     this.disableCanvasGoogleDocPreviews();
+    this.tabSync.clear();
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_GOOGLE_AI_HUB);
   }
 
@@ -1378,7 +1815,12 @@ export default class GoogleAiHubPlugin extends Plugin {
     strikeButton.classList.add("is-strike");
     const bulletButton = createFormattingButton("•", "Bulleted list");
     const numberedButton = createFormattingButton("1.", "Numbered list");
+    const aiButton = createFormattingButton("AI", "AI writing tools");
+    aiButton.classList.add("google-ai-hub-gdoc-ai-button");
 
+    const contentShell = embed.ownerDocument.createElement("div");
+    contentShell.className = "google-ai-hub-gdoc-canvas-editor-shell";
+    embed.appendChild(contentShell);
     const content = embed.ownerDocument.createElement("div");
     content.className = "google-ai-hub-gdoc-canvas-content markdown-rendered";
     content.contentEditable = "false";
@@ -1386,7 +1828,11 @@ export default class GoogleAiHubPlugin extends Plugin {
     content.setAttribute("role", "textbox");
     content.setAttribute("aria-label", "Editable Google Doc content");
     content.setAttribute("aria-multiline", "true");
-    embed.appendChild(content);
+    contentShell.appendChild(content);
+    const emptyGuide = embed.ownerDocument.createElement("div");
+    emptyGuide.className = "google-ai-hub-gdoc-empty-guide";
+    emptyGuide.textContent = "Start typing. Use Paragraph for headings, quotes, and code; B/I/S for emphasis; •/1. for lists; Link or Ctrl+K for links; AI for Summarize, Lengthen, Shorten, and Elaborate.";
+    contentShell.appendChild(emptyGuide);
 
     const turndown = new TurndownService({
       headingStyle: "atx",
@@ -1450,6 +1896,12 @@ export default class GoogleAiHubPlugin extends Plugin {
       return markdown ? `${markdown}\n` : "\n";
     };
 
+    const updateEmptyGuide = (): void => {
+      const empty = content.contentEditable === "true" && !editableMarkdown().trim();
+      contentShell.classList.toggle("is-empty", empty);
+      emptyGuide.setAttribute("aria-hidden", String(!empty));
+    };
+
     const setSaveState = (text: string, state: "saved" | "dirty" | "saving" | "error"): void => {
       status.textContent = text;
       status.dataset.state = state;
@@ -1466,6 +1918,7 @@ export default class GoogleAiHubPlugin extends Plugin {
     };
 
     const markDirty = (): void => {
+      updateEmptyGuide();
       const markdown = editableMarkdown();
       dirty = markdown !== lastSavedMarkdown;
       if (!dirty) {
@@ -1585,6 +2038,7 @@ export default class GoogleAiHubPlugin extends Plugin {
         dirty = false;
         setSaveState(nativeTabsAvailable ? "Saved" : "Setup needed", "saved");
       }
+      updateEmptyGuide();
     };
 
     const descendantIds = (tabId: string): Set<string> => {
@@ -1663,6 +2117,26 @@ export default class GoogleAiHubPlugin extends Plugin {
       }
     };
 
+    const refreshTabsOnly = async (change: GoogleDocTabChange): Promise<void> => {
+      if (controller.signal.aborted) return;
+      const previousActiveTabId = activeTabId;
+      const result = await this.driveBridge.getGoogleDocTabs(documentId);
+      if (controller.signal.aborted) return;
+      tabs = result.tabs;
+      nativeTabsAvailable = result.nativeTabsAvailable;
+      tabsWarning = result.warning || "";
+      if (!tabs.some(tab => tab.id === activeTabId) && !dirty && !saveInFlight) {
+        activeTabId = tabs.find(tab => tab.id === change.tabId)?.id
+          || tabs.find(tab => tab.id === pinnedCanvasTabId)?.id
+          || tabs[0]?.id
+          || "";
+      }
+      renderTabsBar();
+      if (previousActiveTabId !== activeTabId && !dirty && !saveInFlight && activeTabId) {
+        await renderActiveTab();
+      }
+    };
+
     const switchTab = async (tabId: string): Promise<void> => {
       if (tabId === activeTabId || saveInFlight) return;
       if (dirty) await saveDocument();
@@ -1679,7 +2153,8 @@ export default class GoogleAiHubPlugin extends Plugin {
 
     const runTabMutation = async (
       action: () => Promise<void>,
-      nextActiveTabId: () => string = () => activeTabId
+      nextActiveTabId: () => string = () => activeTabId,
+      kind: GoogleDocTabChange["kind"] = "updated"
     ): Promise<void> => {
       if (!nativeTabsAvailable) {
         new Notice(tabsWarning || "Native Google Doc tabs are not available yet.", 9000);
@@ -1692,6 +2167,7 @@ export default class GoogleAiHubPlugin extends Plugin {
         await action();
         activeTabId = nextActiveTabId();
         dirty = false;
+        await this.tabSync.notify({ documentId, kind, tabId: activeTabId });
         await renderDocument(true);
       } catch (error) {
         setSaveState(dirty ? "Unsaved draft" : "Saved", dirty ? "dirty" : "saved");
@@ -1716,7 +2192,7 @@ export default class GoogleAiHubPlugin extends Plugin {
           parentTabId,
           editor.iconEmoji
         );
-      }, () => createdTabId || activeTabId);
+      }, () => createdTabId || activeTabId, "created");
     };
 
     createTabCardFromDrag = async (event: DragEvent, sourceTab: GoogleDocTabInfo): Promise<void> => {
@@ -1785,6 +2261,7 @@ export default class GoogleAiHubPlugin extends Plugin {
         });
         if (!createdNode) throw new Error("Obsidian could not create the new Canvas card.");
         canvasContext.canvas.requestSave();
+        await this.tabSync.notify({ documentId, kind: "created", tabId: createdTabId });
         await renderDocument(true);
         new Notice(`Created ${editor.title} ${editor.placement} ${sourceTab.title} and opened it in a new card.`, 8000);
       } catch (error) {
@@ -1869,6 +2346,7 @@ export default class GoogleAiHubPlugin extends Plugin {
 
         await Promise.resolve(canvas.setData({ ...currentData, nodes: nextNodes }));
         canvas.requestSave();
+        await this.tabSync.notify({ documentId, kind: "created", tabId: createdTabId });
         new Notice(`Created ${editor.title} ${editor.placement} ${sourceTab.title} in the connected card.`, 8000);
       } catch (error) {
         await restoreCanvas();
@@ -1905,7 +2383,7 @@ export default class GoogleAiHubPlugin extends Plugin {
         tab.id,
         tab.parentTabId,
         nextIndex
-      ));
+      ), undefined, "moved");
     };
 
     const nestTab = async (tab: GoogleDocTabInfo): Promise<void> => {
@@ -1921,7 +2399,7 @@ export default class GoogleAiHubPlugin extends Plugin {
         tab.id,
         newParent.id,
         childIndex
-      ));
+      ), undefined, "moved");
     };
 
     const outdentTab = async (tab: GoogleDocTabInfo): Promise<void> => {
@@ -1933,7 +2411,7 @@ export default class GoogleAiHubPlugin extends Plugin {
         tab.id,
         parent.parentTabId,
         parent.index + 1
-      ));
+      ), undefined, "moved");
     };
 
     const deleteTab = async (tab: GoogleDocTabInfo): Promise<void> => {
@@ -1954,7 +2432,8 @@ export default class GoogleAiHubPlugin extends Plugin {
         || remaining[0];
       await runTabMutation(
         () => this.driveBridge.deleteGoogleDocTab(documentId, tab.id),
-        () => nextTab?.id || ""
+        () => nextTab?.id || "",
+        "deleted"
       );
     };
 
@@ -2166,6 +2645,101 @@ export default class GoogleAiHubPlugin extends Plugin {
       markDirty();
     };
 
+    const renderMarkdownFragment = async (markdown: string): Promise<DocumentFragment> => {
+      const host = embed.ownerDocument.createElement("div");
+      const component = new Component();
+      this.addChild(component);
+      try {
+        await MarkdownRenderer.render(
+          this.app,
+          markdown,
+          host,
+          this.settings.googleDocShortcuts[documentId] || "",
+          component
+        );
+        const fragment = embed.ownerDocument.createDocumentFragment();
+        fragment.append(...Array.from(host.childNodes));
+        return fragment;
+      } finally {
+        component.unload();
+        this.removeChild(component);
+      }
+    };
+
+    const canvasAiTarget = (): AiDocumentTarget => {
+      const selection = embed.ownerDocument.getSelection();
+      const currentRange = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      const selectedRange = currentRange && selectionBelongsToContent(currentRange)
+        ? currentRange
+        : savedSelection && selectionBelongsToContent(savedSelection)
+          ? savedSelection
+          : null;
+      const useSelection = Boolean(
+        selectedRange
+        && !selectedRange.collapsed
+        && selectionBelongsToContent(selectedRange)
+      );
+      const range = useSelection ? selectedRange!.cloneRange() : null;
+      const selectionHost = embed.ownerDocument.createElement("div");
+      if (range) selectionHost.appendChild(range.cloneContents());
+      const selectedMarkdown = range ? turndown.turndown(selectionHost.innerHTML).trim() : "";
+      const applyAtRange = async (markdown: string, insertBelow: boolean): Promise<void> => {
+        if (!range) {
+          const next = insertBelow
+            ? `${editableMarkdown().trimEnd()}\n\n${markdown}\n`
+            : markdown;
+          renderComponent?.unload();
+          renderComponent = new Component();
+          this.addChild(renderComponent);
+          content.replaceChildren();
+          await MarkdownRenderer.render(
+            this.app,
+            next,
+            content,
+            this.settings.googleDocShortcuts[documentId] || "",
+            renderComponent
+          );
+          content.contentEditable = "true";
+          markDirty();
+          return;
+        }
+        const targetRange = range.cloneRange();
+        if (insertBelow) targetRange.collapse(false);
+        else targetRange.deleteContents();
+        const fragment = await renderMarkdownFragment(markdown);
+        const lastNode = fragment.lastChild;
+        targetRange.insertNode(fragment);
+        if (lastNode) {
+          const nextRange = embed.ownerDocument.createRange();
+          nextRange.setStartAfter(lastNode);
+          nextRange.collapse(true);
+          savedSelection = nextRange;
+        }
+        markDirty();
+      };
+      return {
+        title: tabs.find(tab => tab.id === activeTabId)?.title || "Google Doc tab",
+        description: range ? "Selected Google Doc tab text" : "Google Doc tab",
+        markdown: selectedMarkdown || editableMarkdown(),
+        readRevision: async () => editableMarkdown(),
+        replace: markdown => applyAtRange(markdown, false),
+        insertBelow: markdown => applyAtRange(markdown, true)
+      };
+    };
+
+    aiButton.addEventListener("pointerdown", preserveFormattingSelection, { signal: controller.signal });
+    aiButton.addEventListener("click", event => {
+      event.preventDefault();
+      const menu = new Menu();
+      for (const action of ["summarize", "shorten", "lengthen", "elaborate"] as const) {
+        menu.addItem(item => item
+          .setTitle(this.aiActionLabel(action))
+          .setIcon("sparkles")
+          .onClick(() => void this.runAiWritingAction(action, canvasAiTarget())));
+      }
+      menu.showAtMouseEvent(event);
+    }, { signal: controller.signal });
+
     controller.signal.addEventListener("abort", () => {
       renderComponent?.unload();
       if (saveTimer !== null) window.clearTimeout(saveTimer);
@@ -2242,7 +2816,155 @@ export default class GoogleAiHubPlugin extends Plugin {
       }, { once: true });
       this.refreshCanvasGoogleDocConnectorMenus();
     }
+    const unregisterTabSync = this.tabSync.register(documentId, refreshTabsOnly);
+    controller.signal.addEventListener("abort", unregisterTabSync, { once: true });
     void renderDocument();
+  }
+
+  private aiActionLabel(action: AiWritingAction): string {
+    return action === "briefing"
+      ? "Briefing report"
+      : action.charAt(0).toUpperCase() + action.slice(1);
+  }
+
+  private async runAiWritingAction(action: AiWritingAction, target: AiDocumentTarget): Promise<void> {
+    const original = target.markdown;
+    const revisionHash = sourceHash(await target.readRevision());
+    let generated: AiResult | null = null;
+    new Notice(`${this.aiActionLabel(action)} with Gemini...`, 4000);
+
+    while (true) {
+      try {
+        generated = await this.geminiAi.generate({
+          action,
+          title: target.title,
+          markdown: original
+        });
+      } catch (error) {
+        new Notice(`AI action failed: ${this.errorMessage(error)} The document was not changed.`, 12000);
+        return;
+      }
+
+      const canWrite = isSourceCurrent(revisionHash, await target.readRevision());
+      const choice = await new AiResultModal(
+        this.app,
+        action,
+        original,
+        generated.markdown,
+        canWrite
+      ).openAndWait();
+      if (!choice) return;
+      if (choice === "regenerate") continue;
+      if (choice === "copy") {
+        await navigator.clipboard.writeText(generated.markdown);
+        new Notice("AI result copied to the clipboard.", 5000);
+        return;
+      }
+      if (!canWrite) return;
+      try {
+        if (choice === "replace") await target.replace(generated.markdown);
+        else await target.insertBelow(generated.markdown);
+        new Notice(`AI ${choice === "replace" ? "replacement" : "result"} applied.`, 5000);
+      } catch (error) {
+        new Notice(`Could not apply the AI result: ${this.errorMessage(error)}`, 10000);
+      }
+      return;
+    }
+  }
+
+  private async runMarkdownAiAction(
+    action: AiWritingAction,
+    editor: Editor,
+    view: { file?: TFile | null }
+  ): Promise<void> {
+    const selected = editor.getSelection();
+    const originalFrom = editor.getCursor("from");
+    const originalTo = editor.getCursor("to");
+    const operatesOnSelection = Boolean(selected);
+    const target: AiDocumentTarget = {
+      title: view.file?.basename || "Obsidian note",
+      description: operatesOnSelection ? "Selected Markdown" : "Current Markdown note",
+      markdown: selected || editor.getValue(),
+      readRevision: async () => editor.getValue(),
+      replace: async markdown => {
+        if (operatesOnSelection) editor.replaceRange(markdown, originalFrom, originalTo);
+        else editor.setValue(markdown);
+      },
+      insertBelow: async markdown => {
+        if (operatesOnSelection) editor.replaceRange(`\n\n${markdown}`, originalTo);
+        else editor.setValue(`${editor.getValue().trimEnd()}\n\n${markdown}\n`);
+      }
+    };
+    await this.runAiWritingAction(action, target);
+  }
+
+  private async googleDocShortcutInfo(file: TFile): Promise<{ documentId: string; url: string }> {
+    const raw = await this.app.vault.cachedRead(file);
+    const shortcut = JSON.parse(raw) as GoogleDocShortcut;
+    const url = shortcut.url || (shortcut.doc_id
+      ? `https://docs.google.com/document/d/${shortcut.doc_id}/edit`
+      : "");
+    const documentId = shortcut.doc_id || (url ? getGoogleDocId(url) : "") || "";
+    if (!documentId || !url) throw new Error("The shortcut does not contain a Google Docs document ID and URL.");
+    return { documentId, url };
+  }
+
+  private async markdownToGoogleDocUpdate(markdown: string, sourcePath: string): Promise<GoogleDocTabContentUpdate> {
+    const host = document.createElement("div");
+    const component = new Component();
+    this.addChild(component);
+    try {
+      await MarkdownRenderer.render(this.app, markdown, host, sourcePath, component);
+      return buildGoogleDocTabContent(host);
+    } finally {
+      component.unload();
+      this.removeChild(component);
+    }
+  }
+
+  private async runStandaloneGoogleDocAiAction(action: AiWritingAction, file: TFile): Promise<void> {
+    if (!this.googleConnected) {
+      new Notice("Connect Google Drive before using document AI on a Google Doc.", 8000);
+      return;
+    }
+    try {
+      const { documentId } = await this.googleDocShortcutInfo(file);
+      const result = await this.driveBridge.getGoogleDocTabs(documentId);
+      const tab = await new GoogleDocTabPickerModal(this.app, result.tabs).openAndWait();
+      if (!tab) return;
+      const readTab = async (): Promise<GoogleDocTabInfo> => {
+        const latest = await this.driveBridge.getGoogleDocTabs(documentId);
+        const current = latest.tabs.find(item => item.id === tab.id);
+        if (!current) throw new Error("The selected Google Doc tab no longer exists.");
+        return current;
+      };
+      const target: AiDocumentTarget = {
+        title: `${file.basename} - ${tab.title}`,
+        description: "Google Doc tab",
+        markdown: tab.markdown,
+        readRevision: async () => (await readTab()).markdown,
+        replace: async markdown => {
+          await this.driveBridge.updateGoogleDocTabContent(
+            documentId,
+            tab.id,
+            await this.markdownToGoogleDocUpdate(markdown, file.path)
+          );
+          await this.tabSync.notify({ documentId, kind: "updated", tabId: tab.id });
+        },
+        insertBelow: async markdown => {
+          const current = await readTab();
+          await this.driveBridge.updateGoogleDocTabContent(
+            documentId,
+            tab.id,
+            await this.markdownToGoogleDocUpdate(`${current.markdown.trimEnd()}\n\n${markdown}\n`, file.path)
+          );
+          await this.tabSync.notify({ documentId, kind: "updated", tabId: tab.id });
+        }
+      };
+      await this.runAiWritingAction(action, target);
+    } catch (error) {
+      new Notice(`Could not use document AI: ${this.errorMessage(error)}`, 10000);
+    }
   }
 
   async activateService(service: ServiceKey): Promise<GoogleAiHubView | null> {
@@ -2276,6 +2998,7 @@ export default class GoogleAiHubPlugin extends Plugin {
       googleCredentialsPath: saved?.googleCredentialsPath || DEFAULT_SETTINGS.googleCredentialsPath,
       googleDocsFolder: saved?.googleDocsFolder || DEFAULT_SETTINGS.googleDocsFolder,
       autoSyncGoogleDocs: saved?.autoSyncGoogleDocs ?? DEFAULT_SETTINGS.autoSyncGoogleDocs,
+      geminiModel: saved?.geminiModel || DEFAULT_SETTINGS.geminiModel,
       googleDocShortcuts: saved?.googleDocShortcuts || {},
       noteMirrors: saved?.noteMirrors || {},
       folderMirrors: saved?.folderMirrors || {}
@@ -2284,6 +3007,167 @@ export default class GoogleAiHubPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+  }
+
+  async generateForSource(
+    action: AiWritingAction,
+    source: AiDocumentSource,
+    instruction?: string,
+    conversation?: Array<{ role: "user" | "model"; text: string }>
+  ): Promise<AiResult> {
+    return this.geminiAi.generate({
+      action,
+      title: source.title,
+      markdown: source.markdown,
+      instruction,
+      conversation
+    });
+  }
+
+  async previewSourceAction(action: AiWritingAction, source: AiDocumentSource): Promise<void> {
+    if (source.readRevision && source.replace && source.insert) {
+      await this.runAiWritingAction(action, {
+        ...source,
+        readRevision: source.readRevision,
+        replace: source.replace,
+        insertBelow: source.insert
+      });
+      return;
+    }
+    while (true) {
+      let result: AiResult;
+      try {
+        result = await this.generateForSource(action, source);
+      } catch (error) {
+        new Notice(`AI request failed: ${this.errorMessage(error)} The source was not changed.`, 11000);
+        return;
+      }
+      const choice = await new AiResultModal(this.app, action, source.markdown, result.markdown, false).openAndWait();
+      if (choice === "regenerate") continue;
+      if (choice === "copy") {
+        await navigator.clipboard.writeText(result.markdown);
+        new Notice("AI result copied to the clipboard.", 5000);
+      }
+      return;
+    }
+  }
+
+  async getActiveAiSource(): Promise<AiDocumentSource | null> {
+    const file = this.app.workspace.getActiveFile();
+    if (file instanceof TFile && (file.extension === "md" || file.extension === "gdoc")) {
+      return this.aiSourceForItem(file);
+    }
+
+    const content = document.querySelector<HTMLElement>(
+      ".canvas-node.is-focused .google-ai-hub-gdoc-canvas-content, .canvas-node.is-selected .google-ai-hub-gdoc-canvas-content"
+    );
+    if (!content) return null;
+    const turndown = new TurndownService({ headingStyle: "atx", bulletListMarker: "-" });
+    const read = async (): Promise<string> => {
+      const markdown = turndown.turndown(content.innerHTML).trimEnd();
+      return markdown ? `${markdown}\n` : "\n";
+    };
+    const apply = async (markdown: string, insert: boolean): Promise<void> => {
+      const component = new Component();
+      this.addChild(component);
+      const host = document.createElement("div");
+      try {
+        await MarkdownRenderer.render(this.app, markdown, host, "", component);
+        if (!insert) content.replaceChildren();
+        content.append(...Array.from(host.childNodes));
+        content.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
+      } finally {
+        component.unload();
+        this.removeChild(component);
+      }
+    };
+    const markdown = await read();
+    return {
+      title: content.getAttribute("aria-label") || "Canvas Google Doc tab",
+      description: "Active Canvas Google Doc tab",
+      markdown,
+      readRevision: read,
+      replace: value => apply(value, false),
+      insert: value => apply(value, true)
+    };
+  }
+
+  async chooseAiSource(): Promise<AiDocumentSource | null> {
+    const item = await new AiSourcePickerModal(this.app).openAndWait();
+    return item ? this.aiSourceForItem(item) : null;
+  }
+
+  private async aiSourceForItem(item: TFile | TFolder): Promise<AiDocumentSource | null> {
+    if (item instanceof TFolder) {
+      const files = this.getMarkdownFiles(item);
+      const sections = await Promise.all(files.map(async file => [
+        `## ${file.basename}`,
+        `Vault path: ${file.path}`,
+        "",
+        await this.app.vault.cachedRead(file)
+      ].join("\n")));
+      return {
+        title: item.isRoot() ? this.app.vault.getName() : item.name,
+        description: `${files.length} Markdown notes from ${item.path || "/"}`,
+        markdown: sections.join("\n\n")
+      };
+    }
+    if (item.extension === "md") {
+      const read = () => this.app.vault.cachedRead(item);
+      const markdown = await read();
+      return {
+        title: item.basename,
+        description: `Markdown note - ${item.path}`,
+        markdown,
+        readRevision: read,
+        replace: value => this.app.vault.modify(item, value),
+        insert: async value => this.app.vault.modify(item, `${(await read()).trimEnd()}\n\n${value}\n`)
+      };
+    }
+    if (!this.googleConnected) {
+      new Notice("Connect Google Drive before selecting a Google Doc as an AI source.", 8000);
+      return null;
+    }
+    const { documentId } = await this.googleDocShortcutInfo(item);
+    const tabsResult = await this.driveBridge.getGoogleDocTabs(documentId);
+    const tab = await new GoogleDocTabPickerModal(this.app, tabsResult.tabs).openAndWait();
+    if (!tab) return null;
+    const readTab = async (): Promise<GoogleDocTabInfo> => {
+      const latest = await this.driveBridge.getGoogleDocTabs(documentId);
+      const current = latest.tabs.find(candidate => candidate.id === tab.id);
+      if (!current) throw new Error("The selected Google Doc tab no longer exists.");
+      return current;
+    };
+    const writeTab = async (value: string): Promise<void> => {
+      await this.driveBridge.updateGoogleDocTabContent(
+        documentId,
+        tab.id,
+        await this.markdownToGoogleDocUpdate(value, item.path)
+      );
+      await this.tabSync.notify({ documentId, kind: "updated", tabId: tab.id });
+    };
+    return {
+      title: `${item.basename} - ${tab.title}`,
+      description: `Google Doc tab - ${item.path}`,
+      markdown: tab.markdown,
+      readRevision: async () => (await readTab()).markdown,
+      replace: writeTab,
+      insert: async value => writeTab(`${(await readTab()).markdown.trimEnd()}\n\n${value}\n`)
+    };
+  }
+
+  async openNotebookLmStudio(source: AiDocumentSource, control: "source" | "mind map" | "audio overview"): Promise<void> {
+    const result = await this.loadSourceIntoService("notebooklm", source.title, source.markdown);
+    const view = this.app.workspace.getLeavesOfType(VIEW_TYPE_GOOGLE_AI_HUB)
+      .map(leaf => leaf.view)
+      .find(candidate => candidate instanceof GoogleAiHubView && candidate.getService() === "notebooklm") as GoogleAiHubView | undefined;
+    const focused = result.ok && view ? await view.focusNotebookLmControl(control) : false;
+    const next = control === "source"
+      ? result.message
+      : focused
+        ? `${result.message} ${control === "mind map" ? "Mind Map" : "Audio Overview"} is focused; generation has not been started.`
+        : `${result.message} Open Studio and choose ${control === "mind map" ? "Mind Map" : "Audio Overview"}; generation has not been started.`;
+    new Notice(next, 12000);
   }
 
   openNotePicker(service: AiService): void {

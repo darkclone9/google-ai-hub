@@ -391,3 +391,154 @@
 .google-ai-hub-gdoc-canvas-error {
   color: var(--text-error);
 }
+
+.google-ai-hub-gdoc-canvas-editor-shell {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.google-ai-hub-gdoc-empty-guide {
+  position: absolute;
+  inset: 0.8rem 1rem auto;
+  display: none;
+  max-width: 42rem;
+  color: var(--text-faint);
+  font-size: var(--font-ui-small);
+  line-height: 1.5;
+  pointer-events: none;
+}
+
+.google-ai-hub-gdoc-canvas-editor-shell.is-empty .google-ai-hub-gdoc-empty-guide {
+  display: block;
+}
+
+.google-ai-hub-gdoc-ai-button {
+  color: var(--interactive-accent) !important;
+  font-weight: 700;
+}
+
+.modal:has(.google-ai-hub-ai-comparison) {
+  width: min(94vw, 1100px);
+}
+
+.google-ai-hub-ai-comparison {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.google-ai-hub-ai-comparison-column {
+  min-width: 0;
+}
+
+.google-ai-hub-ai-result-text {
+  width: 100%;
+  min-height: 48vh;
+  resize: vertical;
+  font-family: var(--font-text);
+  line-height: 1.55;
+}
+
+.google-ai-hub-ai-result-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.google-ai-hub-ai-stale-warning {
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--color-orange);
+  border-radius: var(--radius-m);
+  background: color-mix(in srgb, var(--color-orange) 12%, transparent);
+  color: var(--text-warning);
+}
+
+.google-ai-hub-active-source,
+.google-ai-hub-research-card,
+.google-ai-hub-chat,
+.google-ai-hub-output {
+  padding: 1rem;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-l);
+  background: var(--background-secondary);
+}
+
+.google-ai-hub-active-source {
+  margin-bottom: 1rem;
+}
+
+.google-ai-hub-active-source-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.google-ai-hub-active-source h2,
+.google-ai-hub-active-source h3,
+.google-ai-hub-research-card h2,
+.google-ai-hub-chat h2,
+.google-ai-hub-output h2 {
+  margin-top: 0;
+}
+
+.google-ai-hub-research-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.google-ai-hub-chat,
+.google-ai-hub-output {
+  margin-bottom: 1rem;
+}
+
+.google-ai-hub-chat-log {
+  display: grid;
+  gap: 0.65rem;
+  max-height: 18rem;
+  margin-bottom: 0.75rem;
+  overflow: auto;
+}
+
+.google-ai-hub-chat-message {
+  padding: 0.65rem 0.75rem;
+  border-radius: var(--radius-m);
+  background: var(--background-primary);
+}
+
+.google-ai-hub-chat-message.is-model {
+  border-inline-start: 3px solid var(--interactive-accent);
+}
+
+.google-ai-hub-chat-message p {
+  margin: 0.25rem 0 0;
+  white-space: pre-wrap;
+}
+
+.google-ai-hub-chat-form {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.google-ai-hub-chat-form input {
+  flex: 1 1 auto;
+}
+
+.google-ai-hub-output textarea {
+  width: 100%;
+  min-height: 14rem;
+  margin-bottom: 0.75rem;
+  resize: vertical;
+}
+
+@media (max-width: 760px) {
+  .google-ai-hub-ai-comparison,
+  .google-ai-hub-research-grid {
+    grid-template-columns: 1fr;
+  }
+}
