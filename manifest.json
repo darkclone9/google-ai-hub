@@ -1,0 +1,9 @@
+{
+  "id": "google-ai-hub",
+  "name": "Google AI Hub",
+  "version": "0.6.0",
+  "minAppVersion": "1.8.0",
+  "description": "Use NotebookLM, Gemini, Google Drive, and Google Docs from inside Obsidian.",
+  "author": "Gary",
+  "isDesktopOnly": true
+}
