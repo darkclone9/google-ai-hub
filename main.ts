@@ -49,6 +49,7 @@ import {
   type GeminiModelInfo
 } from "./gemini-ai";
 import { GoogleDocTabSyncRegistry, type GoogleDocTabChange } from "./tab-sync";
+import { migrateNoteMirrorPath, shouldAutoPublishNewNote } from "./auto-publish";
 import {
   CanvasRepairAttemptRegistry,
   GOOGLE_DOC_TAB_DRAG_MIME,
@@ -72,6 +73,7 @@ interface GoogleAiHubSettings {
   googleCredentialsPath: string;
   googleDocsFolder: string;
   autoSyncGoogleDocs: boolean;
+  autoCreateGoogleDocsForNewNotes: boolean;
   geminiModel: string;
   geminiKnownModels: GeminiModelInfo[];
   googleDocShortcuts: Record<string, string>;
@@ -840,6 +842,7 @@ const DEFAULT_SETTINGS: GoogleAiHubSettings = {
   googleCredentialsPath: "C:\\path\\to\\credentials.json",
   googleDocsFolder: "Google Docs",
   autoSyncGoogleDocs: true,
+  autoCreateGoogleDocsForNewNotes: false,
   geminiModel: DEFAULT_GEMINI_MODEL,
   geminiKnownModels: [],
   googleDocShortcuts: {},
@@ -1539,6 +1542,12 @@ class GoogleAiHubSettingTab extends PluginSettingTab {
           this.plugin.settings.autoSyncGoogleDocs = value;
           await this.plugin.saveSettings();
         }));
+    new Setting(containerEl)
+      .setName("Create Google Docs for new notes")
+      .setDesc("Automatically publish future Markdown notes to the Obsidian Notes folder in Google Drive. Managed underscore folders, hidden folders, and the generated Google Docs folder are excluded.")
+      .addToggle(toggle => toggle
+        .setValue(this.plugin.settings.autoCreateGoogleDocsForNewNotes)
+        .onChange(value => this.plugin.setAutoCreateGoogleDocsForNewNotes(value)));
 
     new Setting(containerEl).setName("Privacy and credentials").setHeading();
     containerEl.createEl("p", {
@@ -1575,6 +1584,9 @@ export default class GoogleAiHubPlugin extends Plugin {
   private readonly canvasGoogleDocEmbeds = new Map<CanvasGoogleDocWebview, AbortController>();
   private readonly canvasGoogleDocConnectorActions = new Map<CanvasRuntimeNode, CanvasGoogleDocConnectorAction>();
   private readonly canvasGoogleDocRepairAttempts = new CanvasRepairAttemptRegistry();
+  private readonly autoPublishTimers = new Map<TFile, number>();
+  private readonly autoPublishInFlight = new Set<TFile>();
+  private readonly pendingAutoPublishNotes = new Set<TFile>();
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -1732,6 +1744,22 @@ export default class GoogleAiHubPlugin extends Plugin {
       }
     }));
 
+    this.registerEvent(this.app.vault.on("create", item => {
+      if (item instanceof TFile) this.scheduleAutomaticNotePublish(item);
+    }));
+    this.registerEvent(this.app.vault.on("rename", (item, oldPath) => {
+      if (!(item instanceof TFile)) return;
+      const wasPending = this.autoPublishTimers.has(item) || this.pendingAutoPublishNotes.has(item);
+      const mirrorMoved = migrateNoteMirrorPath(this.settings.noteMirrors, oldPath, item.path);
+      if (mirrorMoved) void this.saveSettings();
+      if (wasPending || mirrorMoved) this.scheduleAutomaticNotePublish(item, 700);
+    }));
+    this.registerEvent(this.app.vault.on("delete", item => {
+      if (!(item instanceof TFile)) return;
+      this.clearAutomaticNotePublishTimer(item);
+      this.pendingAutoPublishNotes.delete(item);
+    }));
+
     this.addSettingTab(new GoogleAiHubSettingTab(this.app, this));
 
     this.app.workspace.onLayoutReady(() => {
@@ -1744,6 +1772,7 @@ export default class GoogleAiHubPlugin extends Plugin {
 
   onunload(): void {
     this.disableCanvasGoogleDocPreviews();
+    this.cancelAutomaticNotePublishing();
     this.tabSync.clear();
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_GOOGLE_AI_HUB);
   }
@@ -3325,6 +3354,8 @@ export default class GoogleAiHubPlugin extends Plugin {
       googleCredentialsPath: saved?.googleCredentialsPath || DEFAULT_SETTINGS.googleCredentialsPath,
       googleDocsFolder: saved?.googleDocsFolder || DEFAULT_SETTINGS.googleDocsFolder,
       autoSyncGoogleDocs: saved?.autoSyncGoogleDocs ?? DEFAULT_SETTINGS.autoSyncGoogleDocs,
+      autoCreateGoogleDocsForNewNotes: saved?.autoCreateGoogleDocsForNewNotes
+        ?? DEFAULT_SETTINGS.autoCreateGoogleDocsForNewNotes,
       geminiModel: saved?.geminiModel || DEFAULT_SETTINGS.geminiModel,
       geminiKnownModels: Array.isArray(saved?.geminiKnownModels) ? saved.geminiKnownModels : [],
       googleDocShortcuts: saved?.googleDocShortcuts || {},
@@ -3335,6 +3366,12 @@ export default class GoogleAiHubPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+  }
+
+  async setAutoCreateGoogleDocsForNewNotes(value: boolean): Promise<void> {
+    this.settings.autoCreateGoogleDocsForNewNotes = value;
+    if (!value) this.cancelAutomaticNotePublishing();
+    await this.saveSettings();
   }
 
   getGeminiModels(): GeminiModelInfo[] {
@@ -3570,6 +3607,7 @@ export default class GoogleAiHubPlugin extends Plugin {
       this.googleConnected = true;
       new Notice("Google Drive connected. Building the Google Docs folder...", 7000);
       await this.syncGoogleDocs();
+      this.flushPendingAutomaticNotePublishes();
     } catch (error) {
       new Notice(`Google Drive connection failed: ${this.errorMessage(error)}`, 10000);
     }
@@ -3595,6 +3633,66 @@ export default class GoogleAiHubPlugin extends Plugin {
     } catch (error) {
       if (showNotice) new Notice(`Could not refresh Google Docs: ${this.errorMessage(error)}`, 10000);
     }
+  }
+
+  private scheduleAutomaticNotePublish(file: TFile, delay = 1400): void {
+    if (
+      !this.settings.autoCreateGoogleDocsForNewNotes
+      || !shouldAutoPublishNewNote(file.path, file.extension, this.settings.googleDocsFolder)
+    ) return;
+    this.clearAutomaticNotePublishTimer(file);
+    const timer = window.setTimeout(() => {
+      this.autoPublishTimers.delete(file);
+      void this.publishNewNoteAutomatically(file);
+    }, delay);
+    this.autoPublishTimers.set(file, timer);
+  }
+
+  private clearAutomaticNotePublishTimer(file: TFile): void {
+    const timer = this.autoPublishTimers.get(file);
+    if (timer !== undefined) window.clearTimeout(timer);
+    this.autoPublishTimers.delete(file);
+  }
+
+  private cancelAutomaticNotePublishing(): void {
+    for (const timer of this.autoPublishTimers.values()) window.clearTimeout(timer);
+    this.autoPublishTimers.clear();
+    this.pendingAutoPublishNotes.clear();
+  }
+
+  private async publishNewNoteAutomatically(file: TFile): Promise<void> {
+    if (
+      !this.settings.autoCreateGoogleDocsForNewNotes
+      || this.app.vault.getAbstractFileByPath(file.path) !== file
+      || !shouldAutoPublishNewNote(file.path, file.extension, this.settings.googleDocsFolder)
+    ) return;
+    if (this.autoPublishInFlight.has(file)) {
+      this.scheduleAutomaticNotePublish(file, 700);
+      return;
+    }
+    if (!this.googleConnected) {
+      const firstPendingNotice = !this.pendingAutoPublishNotes.has(file);
+      this.pendingAutoPublishNotes.add(file);
+      if (firstPendingNotice) {
+        new Notice(`${file.basename} will be published after Google Drive is connected.`, 8000);
+      }
+      return;
+    }
+
+    this.pendingAutoPublishNotes.delete(file);
+    this.autoPublishInFlight.add(file);
+    try {
+      await this.publishNote(file, true);
+    } finally {
+      this.autoPublishInFlight.delete(file);
+    }
+  }
+
+  private flushPendingAutomaticNotePublishes(): void {
+    if (!this.settings.autoCreateGoogleDocsForNewNotes || !this.googleConnected) return;
+    const pending = Array.from(this.pendingAutoPublishNotes);
+    this.pendingAutoPublishNotes.clear();
+    pending.forEach((file, index) => this.scheduleAutomaticNotePublish(file, 300 + index * 250));
   }
 
   private copyActiveNoteForService(

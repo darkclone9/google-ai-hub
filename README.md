@@ -13,6 +13,7 @@ Google AI Hub brings editable Google Docs tabs, Gemini document tools, grounded 
 - Use the same AI workflow in Markdown notes, Canvas Google Doc tabs, and standalone `.gdoc` shortcuts.
 - Research the active source in AI Hub with a summary, briefing report, grounded chat, and NotebookLM Studio launchers.
 - Index Google Drive documents as lightweight `.gdoc` shortcuts without duplicating their contents in the vault.
+- Optionally create a matching native Google Doc whenever a new Markdown note is created.
 
 ## Requirements
 
@@ -49,6 +50,12 @@ Enable **Google AI Hub** in **Settings > Community plugins**. This repository do
 6. Complete consent in the system browser. Reconnect after an upgrade if Google asks for newly required Docs edit access.
 
 The plugin requests Google Docs edit access, Drive read access for indexing/export, and `drive.file` access for files it creates. The refresh token is stored under the local application-data directory, outside the vault.
+
+### Automatic Google Docs for new notes
+
+Enable **Settings > Google AI Hub > Create Google Docs for new notes** to publish every future Markdown note to the **Obsidian Notes** folder in Google Drive. Creation waits briefly so an initial rename or template can settle, reuses the existing mirror mapping to prevent duplicates, and updates the Google Doc title when the note is renamed.
+
+Managed underscore folders such as `_Codex Memory`, hidden folders, non-Markdown files, and the generated Google Docs shortcut folder are excluded. Notes created while Drive is disconnected remain queued for the current Obsidian session and publish after reconnection. Enabling the setting does not backfill existing notes.
 
 ## Gemini key setup
 
