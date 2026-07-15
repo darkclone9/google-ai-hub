@@ -50,7 +50,12 @@ import {
 } from "./gemini-ai";
 import { GoogleDocTabSyncRegistry, type GoogleDocTabChange } from "./tab-sync";
 import { migrateNoteMirrorPath, shouldAutoPublishNewNote } from "./auto-publish";
-import { chooseGoogleDocTabPlacement } from "./tab-placement";
+import {
+  chooseGoogleDocTabLiftPlan,
+  chooseGoogleDocTabPlacement,
+  type GoogleDocTabLiftPlan,
+  type GoogleDocTabPlacement
+} from "./tab-placement";
 import {
   CanvasRepairAttemptRegistry,
   GOOGLE_DOC_TAB_DRAG_MIME,
@@ -106,9 +111,15 @@ interface TabEditorResult {
 }
 
 type TabCardPlacement = "above" | "below";
+type TabDepthChoice = "lift" | "sibling";
 
 interface TabCardEditorResult extends TabEditorResult {
   placement: TabCardPlacement;
+}
+
+interface PreparedTabPlacement {
+  placement: GoogleDocTabPlacement;
+  liftPlan: GoogleDocTabLiftPlan | null;
 }
 
 interface StoredGoogleDocDraft {
@@ -381,6 +392,62 @@ class TabCardEditorModal extends Modal {
     if (this.settled) return;
     this.settled = true;
     this.resolver?.(result);
+    this.resolver = null;
+    if (close) this.close();
+  }
+}
+
+class TabDepthLimitModal extends Modal {
+  private resolver: ((choice: TabDepthChoice | null) => void) | null = null;
+  private settled = false;
+
+  constructor(
+    app: App,
+    private readonly sourceTitle: string,
+    private readonly branchTitle: string,
+    private readonly formerParentTitle: string
+  ) {
+    super(app);
+  }
+
+  openAndWait(): Promise<TabDepthChoice | null> {
+    return new Promise(resolve => {
+      this.resolver = resolve;
+      this.open();
+    });
+  }
+
+  onOpen(): void {
+    this.titleEl.setText("Google Docs tab depth limit");
+    this.contentEl.empty();
+    this.contentEl.createEl("p", {
+      text: `“${this.sourceTitle}” is already at Google Docs’ deepest tab level. To create a true child, “${this.branchTitle}” must move out from under “${this.formerParentTitle}”. Its existing child tabs stay together.`
+    });
+    this.contentEl.createEl("p", {
+      text: "You can keep the new tab beside the source without changing the hierarchy, or lift the branch and nest it beneath the source."
+    });
+    new Setting(this.contentEl)
+      .addButton(button => button
+        .setButtonText("Cancel")
+        .onClick(() => this.finish(null)))
+      .addButton(button => button
+        .setButtonText("Keep beside")
+        .onClick(() => this.finish("sibling")))
+      .addButton(button => button
+        .setButtonText("Lift branch and nest")
+        .setCta()
+        .onClick(() => this.finish("lift")));
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    if (!this.settled) this.finish(null, false);
+  }
+
+  private finish(choice: TabDepthChoice | null, close = true): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.resolver?.(choice);
     this.resolver = null;
     if (close) this.close();
   }
@@ -2468,6 +2535,51 @@ export default class GoogleAiHubPlugin extends Plugin {
       }
     };
 
+    const prepareTabPlacement = async (
+      sourceTab: GoogleDocTabInfo
+    ): Promise<PreparedTabPlacement | null> => {
+      const placement = chooseGoogleDocTabPlacement(tabs, sourceTab);
+      if (!placement.limitedByDepth) return { placement, liftPlan: null };
+
+      const liftPlan = chooseGoogleDocTabLiftPlan(tabs, sourceTab);
+      if (!liftPlan) return { placement, liftPlan: null };
+      const branch = tabs.find(tab => tab.id === liftPlan.branchTabId);
+      const formerParent = tabs.find(tab => tab.id === liftPlan.originalParentTabId);
+      if (!branch || !formerParent) return { placement, liftPlan: null };
+
+      const choice = await new TabDepthLimitModal(
+        this.app,
+        sourceTab.title,
+        branch.title,
+        formerParent.title
+      ).openAndWait();
+      if (!choice) return null;
+      return choice === "lift"
+        ? { placement: liftPlan.childPlacement, liftPlan }
+        : { placement, liftPlan: null };
+    };
+
+    const applyBranchLift = async (liftPlan: GoogleDocTabLiftPlan | null): Promise<boolean> => {
+      if (!liftPlan) return false;
+      await this.driveBridge.moveGoogleDocTab(
+        documentId,
+        liftPlan.branchTabId,
+        liftPlan.liftedParentTabId,
+        liftPlan.liftedIndex
+      );
+      return true;
+    };
+
+    const rollbackBranchLift = async (liftPlan: GoogleDocTabLiftPlan | null): Promise<void> => {
+      if (!liftPlan) return;
+      await this.driveBridge.moveGoogleDocTab(
+        documentId,
+        liftPlan.branchTabId,
+        liftPlan.originalParentTabId,
+        liftPlan.originalIndex
+      );
+    };
+
     const addTab = async (parentTabId: string): Promise<void> => {
       const parent = tabs.find(tab => tab.id === parentTabId);
       const editor = await new TabEditorModal(
@@ -2477,14 +2589,25 @@ export default class GoogleAiHubPlugin extends Plugin {
         ""
       ).openAndWait();
       if (!editor) return;
+      const prepared = parent ? await prepareTabPlacement(parent) : null;
+      if (parent && !prepared) return;
       let createdTabId = "";
       await runTabMutation(async () => {
-        createdTabId = await this.driveBridge.addGoogleDocTab(
-          documentId,
-          editor.title,
-          parentTabId,
-          editor.iconEmoji
-        );
+        let branchLifted = false;
+        try {
+          branchLifted = await applyBranchLift(prepared?.liftPlan || null);
+          createdTabId = await this.driveBridge.addGoogleDocTab(
+            documentId,
+            editor.title,
+            prepared?.placement.parentTabId || parentTabId,
+            editor.iconEmoji,
+            prepared?.placement.index
+          );
+          if (!createdTabId) throw new Error("Google Docs did not return the new tab ID.");
+        } catch (error) {
+          if (branchLifted) await rollbackBranchLift(prepared?.liftPlan || null);
+          throw error;
+        }
       }, () => createdTabId || activeTabId, "created");
     };
 
@@ -2703,6 +2826,8 @@ export default class GoogleAiHubPlugin extends Plugin {
       void (async () => {
         let createdTabId = "";
         let cardRecreated = false;
+        let prepared: PreparedTabPlacement | null = null;
+        let branchLifted = false;
         try {
           let targetData: (Record<string, unknown> & { id: string; type: string }) | null = null;
           for (let attempt = 0; attempt < 240 && !targetData; attempt += 1) {
@@ -2725,8 +2850,11 @@ export default class GoogleAiHubPlugin extends Plugin {
           }
 
           const markdown = await this.app.vault.cachedRead(note);
-          const placement = chooseGoogleDocTabPlacement(tabs, sourceTab);
+          prepared = await prepareTabPlacement(sourceTab);
+          if (!prepared) return;
+          const placement = prepared.placement;
           setSaveState(`Creating ${placement.relationship} tab…`, "saving");
+          branchLifted = await applyBranchLift(prepared.liftPlan);
           createdTabId = await this.driveBridge.addGoogleDocTab(
             documentId,
             note.basename,
@@ -2756,15 +2884,24 @@ export default class GoogleAiHubPlugin extends Plugin {
           this.scheduleCanvasGoogleDocRefresh();
           await this.tabSync.notify({ documentId, kind: "created", tabId: createdTabId });
           await renderDocument(true);
-          new Notice(placement.limitedByDepth
-            ? `Created ${note.basename} beside ${sourceTab.title} because Google Docs cannot nest tabs any deeper.`
-            : `Created ${note.basename} under ${sourceTab.title} and opened its Google Doc interface.`, 9000);
+          new Notice(prepared.liftPlan
+            ? `Lifted the containing branch and created ${note.basename} under ${sourceTab.title}.`
+            : placement.limitedByDepth
+              ? `Created ${note.basename} beside ${sourceTab.title}.`
+              : `Created ${note.basename} under ${sourceTab.title} and opened its Google Doc interface.`, 9000);
         } catch (error) {
           if (createdTabId && !cardRecreated) {
             try {
               await this.driveBridge.deleteGoogleDocTab(documentId, createdTabId);
             } catch {
               // Preserve the original Markdown card even if rollback also fails.
+            }
+          }
+          if (branchLifted && !cardRecreated) {
+            try {
+              await rollbackBranchLift(prepared?.liftPlan || null);
+            } catch {
+              // The source note and Canvas card remain untouched if hierarchy rollback fails.
             }
           }
           setSaveState(dirty ? "Unsaved draft" : "Saved", dirty ? "dirty" : "saved");
@@ -2813,13 +2950,27 @@ export default class GoogleAiHubPlugin extends Plugin {
       const current = siblings.findIndex(item => item.id === tab.id);
       if (current <= 0) return;
       const newParent = siblings[current - 1];
-      const childIndex = tabs.filter(item => item.parentTabId === newParent.id).length;
-      await runTabMutation(() => this.driveBridge.moveGoogleDocTab(
-        documentId,
-        tab.id,
-        newParent.id,
-        childIndex
-      ), undefined, "moved");
+      const prepared = await prepareTabPlacement(newParent);
+      if (!prepared) return;
+      if (prepared.placement.relationship !== "child") {
+        new Notice(`${tab.title} remains beside ${newParent.title}.`, 5000);
+        return;
+      }
+      await runTabMutation(async () => {
+        let branchLifted = false;
+        try {
+          branchLifted = await applyBranchLift(prepared.liftPlan);
+          await this.driveBridge.moveGoogleDocTab(
+            documentId,
+            tab.id,
+            prepared.placement.parentTabId,
+            prepared.placement.index
+          );
+        } catch (error) {
+          if (branchLifted) await rollbackBranchLift(prepared.liftPlan);
+          throw error;
+        }
+      }, undefined, "moved");
     };
 
     const outdentTab = async (tab: GoogleDocTabInfo): Promise<void> => {
