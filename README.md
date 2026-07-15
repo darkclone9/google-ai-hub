@@ -106,9 +106,9 @@ AI Hub starts with the active document when possible. Use **Choose source** to s
 - **Summary** generates a direct grounded result with Copy and Insert actions.
 - **Briefing report** uses the complete Original/Result preview workflow.
 - **Grounded chat** answers from the selected source. History is session-only and resets when the source changes.
-- **Add as source**, **Mind Map**, and **Audio Overview** load the source into the open NotebookLM notebook and focus the requested Studio area without automatically starting generation.
+- **Add as source**, **Mind Map**, and **Audio Overview** load the source into the open NotebookLM notebook and focus the requested Studio area without automatically starting generation. The plugin verifies that NotebookLM accepted the complete copied text before it clicks **Insert**, then waits for the editor to close or a source-processing confirmation.
 
-NotebookLM is kept as an embedded research and Studio surface because it does not provide this plugin a reliable editor-result API. Its web interface can change, an open destination notebook is required, and Studio controls may need to be selected manually when NotebookLM cannot be focused automatically. Direct editor transformations use Gemini's REST API so their returned text can be reviewed safely. Google's [NotebookLM feature guide](https://support.google.com/notebooklm/answer/16206563) describes the available Studio outputs.
+NotebookLM is kept as an embedded research and Studio surface because it does not provide this plugin a reliable editor-result API. Its web interface can change, an open destination notebook is required, and Studio controls may need to be selected manually when NotebookLM cannot be focused automatically. Direct editor transformations use Gemini's REST API so their returned text can be reviewed safely. Google's [NotebookLM source guide](https://support.google.com/notebooklm/answer/16215270) documents Copied text sources, and its [feature guide](https://support.google.com/notebooklm/answer/16206563) describes the available Studio outputs.
 
 ## Privacy
 
@@ -139,7 +139,7 @@ Open **Settings > Google AI Hub > Default Gemini model**, choose **Refresh avail
 
 ### NotebookLM did not add or focus the source
 
-Open the intended notebook inside the embedded NotebookLM view and run the action again. The prepared source is also copied by the legacy source workflow when automatic insertion is unavailable.
+Open the intended notebook inside the embedded NotebookLM view, confirm that you can edit it, and run the action again. The plugin reports success only after it verifies the copied text and detects that NotebookLM accepted the submission. If NotebookLM rejects automatic input, the Copied text box stays focused and the complete source is placed on your clipboard; press `Ctrl+V`, confirm the text appears, and click **Insert**. If clipboard access is blocked, return to the source document and copy its text manually.
 
 ### An AI result cannot be applied
 

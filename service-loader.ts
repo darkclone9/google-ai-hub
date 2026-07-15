@@ -1,7 +1,7 @@
 export interface SourceLoadResult {
   ok: boolean;
   message: string;
-  mode?: "gemini-prompt" | "notebooklm-source" | "notebooklm-dialog";
+  mode?: "gemini-prompt" | "notebooklm-source" | "notebooklm-dialog" | "notebooklm-clipboard";
 }
 
 export function buildGeminiLoaderScript(title: string, content: string): string {
@@ -132,18 +132,118 @@ export function buildNotebookLmLoaderScript(title: string, content: string): str
 (async () => {
   const payload = ${payload};
   const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-  const visible = element => Boolean(element && element.getClientRects().length && getComputedStyle(element).visibility !== "hidden");
+  const visible = element => {
+    if (!element?.getClientRects?.().length) return false;
+    const view = element.ownerDocument?.defaultView || window;
+    const style = view.getComputedStyle(element);
+    return style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity || "1") > 0;
+  };
+  const deepElements = () => {
+    const roots = [document];
+    const elements = [];
+    for (let index = 0; index < roots.length; index += 1) {
+      const root = roots[index];
+      for (const element of root.querySelectorAll?.("*") || []) {
+        elements.push(element);
+        if (element.shadowRoot) roots.push(element.shadowRoot);
+        if (element.tagName === "IFRAME") {
+          try {
+            if (element.contentDocument) roots.push(element.contentDocument);
+          } catch (_) {
+            // Ignore cross-origin frames. NotebookLM currently renders controls in the main document.
+          }
+        }
+      }
+    }
+    return elements;
+  };
   const label = element => [
     element.getAttribute?.("aria-label") || "",
     element.getAttribute?.("title") || "",
-    element.textContent || ""
+    element.getAttribute?.("placeholder") || "",
+    element.innerText || element.textContent || ""
   ].join(" ").replace(/\\s+/g, " ").trim();
-  const clickable = root => Array.from(root.querySelectorAll('button, [role="button"], mat-card, .mat-mdc-card'))
-    .filter(visible);
+  const normalized = value => String(value || "").replace(/\\s+/g, " ").trim();
+  const disabled = element => Boolean(
+    element.disabled
+    || element.getAttribute?.("aria-disabled") === "true"
+    || element.classList?.contains("mat-mdc-button-disabled")
+  );
+  const clickable = () => deepElements().filter(element =>
+    visible(element)
+    && !disabled(element)
+    && (element.matches?.('button, [role="button"], mat-card, .mat-mdc-card, [tabindex="0"]'))
+  );
+  const dialogElement = () => deepElements().find(element =>
+    visible(element)
+    && (element.getAttribute?.("role") === "dialog"
+      || element.matches?.("mat-dialog-container, .mat-mdc-dialog-container"))
+  ) || null;
+  const inside = (element, root) => !root || root === element || root.contains?.(element);
+  const findClickable = (pattern, root = null) => clickable()
+    .filter(element => inside(element, root) && pattern.test(label(element)))
+    .sort((left, right) => normalized(label(left)).length - normalized(label(right)).length)[0] || null;
+  const readValue = element => "value" in element
+    ? element.value
+    : (element.innerText || element.textContent || "");
+  const setNativeValue = (element, value) => {
+    const view = element.ownerDocument?.defaultView || window;
+    const tag = element.tagName?.toLowerCase();
+    const prototype = tag === "textarea"
+      ? view.HTMLTextAreaElement?.prototype
+      : view.HTMLInputElement?.prototype;
+    const setter = prototype && Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+    if (setter) setter.call(element, value);
+    else element.value = value;
+  };
+  const dispatchInput = (element, value) => {
+    const view = element.ownerDocument?.defaultView || window;
+    try {
+      element.dispatchEvent(new view.InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data: value
+      }));
+    } catch (_) {
+      // Older embedded Chromium builds may not construct beforeinput directly.
+    }
+    try {
+      element.dispatchEvent(new view.InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: value
+      }));
+    } catch (_) {
+      element.dispatchEvent(new view.Event("input", { bubbles: true }));
+    }
+    element.dispatchEvent(new view.Event("change", { bubbles: true }));
+  };
+  const fillEditor = (element, value) => {
+    element.focus();
+    const tag = element.tagName?.toLowerCase();
+    if (tag === "textarea" || tag === "input") {
+      setNativeValue(element, value);
+      if (element.setSelectionRange) element.setSelectionRange(value.length, value.length);
+      dispatchInput(element, value);
+      return;
+    }
+    const ownerDocument = element.ownerDocument || document;
+    const selection = ownerDocument.getSelection();
+    const range = ownerDocument.createRange();
+    range.selectNodeContents(element);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    const inserted = ownerDocument.execCommand?.("insertText", false, value);
+    if (!inserted || !normalized(readValue(element))) {
+      element.replaceChildren(ownerDocument.createTextNode(value));
+    }
+    dispatchInput(element, value);
+  };
 
   let addSource = null;
-  for (let attempt = 0; attempt < 32 && !addSource; attempt += 1) {
-    addSource = clickable(document).find(element => /add source/i.test(label(element))) || null;
+  for (let attempt = 0; attempt < 48 && !addSource; attempt += 1) {
+    addSource = findClickable(/add source|add sources|upload source|^\\+?\\s*add$/i);
     if (!addSource) await sleep(250);
   }
   if (!addSource) {
@@ -155,9 +255,9 @@ export function buildNotebookLmLoaderScript(title: string, content: string): str
   addSource.click();
 
   let copiedText = null;
-  for (let attempt = 0; attempt < 32 && !copiedText; attempt += 1) {
-    const dialog = document.querySelector('[role="dialog"], mat-dialog-container, .mat-mdc-dialog-container') || document;
-    copiedText = clickable(dialog).find(element => /copied text|paste text/i.test(label(element))) || null;
+  for (let attempt = 0; attempt < 48 && !copiedText; attempt += 1) {
+    const dialog = dialogElement();
+    copiedText = findClickable(/copied text|paste text|text from clipboard/i, dialog) || null;
     if (!copiedText) await sleep(250);
   }
   if (!copiedText) {
@@ -167,51 +267,95 @@ export function buildNotebookLmLoaderScript(title: string, content: string): str
 
   let editor = null;
   let dialog = null;
-  for (let attempt = 0; attempt < 40 && !editor; attempt += 1) {
-    dialog = document.querySelector('[role="dialog"], mat-dialog-container, .mat-mdc-dialog-container') || document;
-    const candidates = Array.from(dialog.querySelectorAll('textarea, [contenteditable="true"][role="textbox"], [contenteditable="true"]'));
-    editor = candidates.find(visible) || null;
+  for (let attempt = 0; attempt < 60 && !editor; attempt += 1) {
+    dialog = dialogElement();
+    const candidates = deepElements()
+      .filter(element => inside(element, dialog) && visible(element))
+      .filter(element => element.matches?.('textarea, [role="textbox"], [contenteditable="true"], .ProseMirror'))
+      .map(element => {
+        const text = label(element).toLowerCase();
+        const rect = element.getBoundingClientRect?.();
+        let score = 0;
+        if (/paste|copied text|source text|text content/.test(text)) score += 100;
+        if (element.tagName === "TEXTAREA") score += 60;
+        if (element.isContentEditable || element.getAttribute?.("contenteditable") === "true") score += 45;
+        if (element.getAttribute?.("role") === "textbox") score += 25;
+        if (rect && rect.width > 300 && rect.height > 100) score += 50;
+        if (/title|search|url|website/.test(text)) score -= 150;
+        return { element, score };
+      })
+      .sort((left, right) => right.score - left.score);
+    editor = candidates[0]?.score >= 0 ? candidates[0].element : null;
     if (!editor) await sleep(250);
   }
   if (!editor) {
     return { ok: false, message: "NotebookLM opened Copied text, but its text box was not available." };
   }
 
-  editor.focus();
-  if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
-    const prototype = editor instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
-    if (setter) setter.call(editor, payload.content);
-    else editor.value = payload.content;
-  } else {
-    editor.replaceChildren(document.createTextNode(payload.content));
+  const titleInput = deepElements().find(element =>
+    inside(element, dialog)
+    && visible(element)
+    && element.matches?.('input[type="text"], input:not([type])')
+    && /title|source name/.test(label(element).toLowerCase())
+  );
+  if (titleInput) {
+    setNativeValue(titleInput, payload.title);
+    dispatchInput(titleInput, payload.title);
   }
-  editor.dispatchEvent(new InputEvent("input", {
-    bubbles: true,
-    inputType: "insertText",
-    data: payload.content
-  }));
-  editor.dispatchEvent(new Event("change", { bubbles: true }));
+
+  fillEditor(editor, payload.content);
+  await sleep(500);
+
+  const expected = normalized(payload.content);
+  const actual = normalized(readValue(editor));
+  const fingerprint = expected.slice(0, Math.min(100, expected.length));
+  const minimumLength = Math.min(expected.length, 160);
+  if (!actual.includes(fingerprint) || actual.length < minimumLength) {
+    editor.focus();
+    return {
+      ok: false,
+      mode: "notebooklm-clipboard",
+      message: "NotebookLM opened Copied text but rejected automatic input. The text box is focused and the full source is on your clipboard; press Ctrl+V, verify the text appears, then click Insert."
+    };
+  }
 
   let insertButton = null;
-  for (let attempt = 0; attempt < 24 && !insertButton; attempt += 1) {
-    dialog = document.querySelector('[role="dialog"], mat-dialog-container, .mat-mdc-dialog-container') || document;
-    insertButton = clickable(dialog).find(element => /^(insert|add source|save)$/i.test(label(element)) && !element.disabled) || null;
+  for (let attempt = 0; attempt < 40 && !insertButton; attempt += 1) {
+    dialog = dialogElement();
+    insertButton = findClickable(/^(insert|add|add source|save|submit)$/i, dialog);
     if (!insertButton) await sleep(250);
   }
   if (!insertButton) {
     return {
-      ok: true,
+      ok: false,
       mode: "notebooklm-dialog",
-      message: payload.title + " is loaded in NotebookLM's Copied text dialog. Click Insert to finish adding it."
+      message: payload.title + " is loaded and verified in NotebookLM's Copied text dialog, but the Insert button could not be activated. Click Insert to finish adding it."
     };
   }
 
   insertButton.click();
+  let submitted = false;
+  for (let attempt = 0; attempt < 60 && !submitted; attempt += 1) {
+    await sleep(250);
+    const activeDialog = dialogElement();
+    const pageLabels = deepElements().filter(visible).map(label);
+    submitted = !editor.isConnected
+      || !visible(editor)
+      || (activeDialog && !inside(editor, activeDialog))
+      || !activeDialog
+      || pageLabels.some(text => /source added|adding source|processing source|uploading source/i.test(text));
+  }
+  if (!submitted) {
+    return {
+      ok: false,
+      mode: "notebooklm-dialog",
+      message: "NotebookLM received the source text, but did not confirm the insertion. The content remains in the dialog and on your clipboard; click Insert once and confirm the new source appears."
+    };
+  }
   return {
     ok: true,
     mode: "notebooklm-source",
-    message: payload.title + " was added to NotebookLM as a Copied text source."
+    message: payload.title + " was submitted to NotebookLM with its copied text verified before insertion."
   };
 })()
 `;

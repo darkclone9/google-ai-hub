@@ -3362,6 +3362,10 @@ export default class GoogleAiHubPlugin extends Plugin {
 
   async openNotebookLmStudio(source: AiDocumentSource, control: "source" | "mind map" | "audio overview"): Promise<void> {
     const result = await this.loadSourceIntoService("notebooklm", source.title, source.markdown);
+    if (!result.ok) {
+      new Notice(result.message, 14000);
+      return;
+    }
     const view = this.app.workspace.getLeavesOfType(VIEW_TYPE_GOOGLE_AI_HUB)
       .map(leaf => leaf.view)
       .find(candidate => candidate instanceof GoogleAiHubView && candidate.getService() === "notebooklm") as GoogleAiHubView | undefined;
@@ -3459,9 +3463,25 @@ export default class GoogleAiHubPlugin extends Plugin {
     title: string,
     content: string
   ): Promise<SourceLoadResult> {
+    let notebookLmClipboardReady = false;
+    if (service === "notebooklm") {
+      try {
+        await navigator.clipboard.writeText(`# ${title}\n\n${content}`);
+        notebookLmClipboardReady = true;
+      } catch {
+        // Automatic insertion can still work. If it does not, report that the clipboard fallback is unavailable.
+      }
+    }
     const view = await this.activateService(service);
     if (!view) return { ok: false, message: "The AI view could not be opened." };
-    return view.loadSource(title, content);
+    const result = await view.loadSource(title, content);
+    if (!result.ok && result.mode === "notebooklm-clipboard" && !notebookLmClipboardReady) {
+      return {
+        ...result,
+        message: "NotebookLM rejected automatic input and Obsidian could not access the clipboard. Return to the source document, copy its text, then paste it into the focused Copied text box and click Insert."
+      };
+    }
+    return result;
   }
 
   private async prepareNoteForService(
