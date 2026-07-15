@@ -155,7 +155,19 @@
 }
 
 .canvas-node.google-ai-hub-gdoc-canvas-node .canvas-node-content-blocker {
-  pointer-events: none;
+  top: 0;
+  right: auto;
+  bottom: auto;
+  left: 0;
+  z-index: 5;
+  width: 2rem;
+  height: 2.25rem;
+  cursor: grab;
+  pointer-events: auto !important;
+}
+
+.canvas-node.google-ai-hub-gdoc-canvas-node .canvas-node-content-blocker:active {
+  cursor: grabbing;
 }
 
 .google-ai-hub-gdoc-canvas-toolbar {
@@ -175,6 +187,15 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.google-ai-hub-gdoc-canvas-drag-handle {
+  flex: 0 0 1.15rem;
+  color: var(--text-faint);
+  font-size: 1rem;
+  line-height: 1;
+  text-align: center;
+  pointer-events: none;
 }
 
 .google-ai-hub-gdoc-canvas-status {

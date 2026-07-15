@@ -49,6 +49,11 @@ import {
   type GeminiModelInfo
 } from "./gemini-ai";
 import { GoogleDocTabSyncRegistry, type GoogleDocTabChange } from "./tab-sync";
+import {
+  GOOGLE_DOC_TAB_DRAG_MIME,
+  parseGoogleDocTabDrag,
+  serializeGoogleDocTabDrag
+} from "./canvas-tab-drag";
 
 const VIEW_TYPE_GOOGLE_AI_HUB = "google-ai-hub-view";
 const GEMINI_SECRET_ID = "google-ai-hub-gemini-api-key";
@@ -783,7 +788,7 @@ interface CanvasRuntime {
   getData(): CanvasRuntimeData;
   getSelectionData(): CanvasRuntimeData;
   setData(data: CanvasRuntimeData): void | Promise<void>;
-  posFromClient(event: MouseEvent): { x: number; y: number };
+  posFromClient(event: { clientX: number; clientY: number }): { x: number; y: number };
   createFileNode(options: {
     pos: { x: number; y: number };
     position: "center";
@@ -1758,7 +1763,11 @@ export default class GoogleAiHubPlugin extends Plugin {
       controller.abort();
       const embed = webview.closest<HTMLElement>(".gdocs-embed");
       embed?.classList.remove("google-ai-hub-gdoc-canvas-preview");
-      embed?.closest<HTMLElement>(".canvas-node")?.classList.remove("google-ai-hub-gdoc-canvas-node");
+      const canvasNode = embed?.closest<HTMLElement>(".canvas-node");
+      canvasNode?.classList.remove("google-ai-hub-gdoc-canvas-node");
+      const moveBlocker = canvasNode?.querySelector<HTMLElement>(".canvas-node-content-blocker");
+      moveBlocker?.removeAttribute("title");
+      moveBlocker?.removeAttribute("aria-label");
       embed?.querySelectorAll(
         ".google-ai-hub-gdoc-canvas-toolbar, .google-ai-hub-gdoc-canvas-tabs, .google-ai-hub-gdoc-formatting, .google-ai-hub-gdoc-canvas-content"
       ).forEach(element => element.remove());
@@ -1867,12 +1876,26 @@ export default class GoogleAiHubPlugin extends Plugin {
       ".google-ai-hub-gdoc-canvas-toolbar, .google-ai-hub-gdoc-canvas-tabs, .google-ai-hub-gdoc-formatting, .google-ai-hub-gdoc-canvas-content"
     ).forEach(element => element.remove());
     embed.classList.add("google-ai-hub-gdoc-canvas-preview");
-    embed.closest<HTMLElement>(".canvas-node")?.classList.add("google-ai-hub-gdoc-canvas-node");
+    const canvasNodeElement = embed.closest<HTMLElement>(".canvas-node");
+    canvasNodeElement?.classList.add("google-ai-hub-gdoc-canvas-node");
+    const canvasMoveBlocker = canvasNodeElement?.querySelector<HTMLElement>(".canvas-node-content-blocker");
+    canvasMoveBlocker?.setAttribute("title", "Drag to move this Canvas card");
+    canvasMoveBlocker?.setAttribute("aria-label", "Move Canvas card");
 
     const toolbar = embed.ownerDocument.createElement("div");
     toolbar.className = "google-ai-hub-gdoc-canvas-toolbar";
     toolbar.addEventListener("click", event => event.stopPropagation(), { signal: controller.signal });
-    toolbar.addEventListener("pointerdown", event => event.stopPropagation(), { signal: controller.signal });
+    toolbar.addEventListener("pointerdown", event => {
+      const target = event.target as Element | null;
+      if (target?.closest("button, input, select, textarea, a")) event.stopPropagation();
+    }, { signal: controller.signal });
+
+    const dragHandle = embed.ownerDocument.createElement("span");
+    dragHandle.className = "google-ai-hub-gdoc-canvas-drag-handle";
+    dragHandle.textContent = "⠿";
+    dragHandle.title = "Drag to move this Canvas card";
+    dragHandle.setAttribute("aria-hidden", "true");
+    toolbar.appendChild(dragHandle);
 
     const label = embed.ownerDocument.createElement("span");
     label.className = "google-ai-hub-gdoc-canvas-title";
@@ -1991,8 +2014,22 @@ export default class GoogleAiHubPlugin extends Plugin {
     let tabsWarning = "";
     const canvasContext = this.findCanvasRuntimeContext(embed);
     const pinnedCanvasTabId = parseGoogleDocTabSubpath(canvasContext?.node.getData().subpath);
-    let createTabCardFromDrag: (event: DragEvent, tab: GoogleDocTabInfo) => Promise<void> = async () => {};
+    let createExistingTabCardFromDrop: (
+      point: { clientX: number; clientY: number },
+      tab: GoogleDocTabInfo
+    ) => Promise<void> = async () => {};
+    let createNewTabCardFromDrop: (
+      point: { clientX: number; clientY: number },
+      tab: GoogleDocTabInfo
+    ) => Promise<void> = async () => {};
     let createTabCardFromConnector: (addCardButton: HTMLElement) => Promise<void> = async () => {};
+    let activeTabDrag: {
+      tabId: string;
+      origin: { clientX: number; clientY: number };
+      lastPoint: { clientX: number; clientY: number };
+      createNewTab: boolean;
+      handled: boolean;
+    } | null = null;
     const draftStorageKey = (): string =>
       `google-ai-hub:gdoc-draft:${documentId}:${activeTabId || "document"}`;
 
@@ -2202,10 +2239,9 @@ export default class GoogleAiHubPlugin extends Plugin {
         button.style.setProperty("--google-ai-hub-tab-depth", String(tab.nestingLevel));
         button.textContent = `${tab.iconEmoji || (tab.nestingLevel ? "↳" : "▤")} ${tab.title}`;
         button.title = nativeTabsAvailable
-          ? `${tab.title} — drag onto the Canvas to create a new tab card; double-click to rename; right-click for actions`
+          ? `${tab.title} — drag onto the Canvas to create a card for this tab; hold Shift while dragging to create a new sibling tab; double-click to rename; right-click for actions`
           : tab.title;
-        button.draggable = nativeTabsAvailable;
-        let dragOrigin: { x: number; y: number } | null = null;
+        button.draggable = nativeTabsAvailable && Boolean(canvasContext);
         button.addEventListener("click", () => void switchTab(tab.id), { signal: controller.signal });
         button.addEventListener("dblclick", event => {
           event.preventDefault();
@@ -2217,21 +2253,41 @@ export default class GoogleAiHubPlugin extends Plugin {
         }, { signal: controller.signal });
         button.addEventListener("dragstart", event => {
           event.stopPropagation();
-          dragOrigin = { x: event.clientX, y: event.clientY };
-          button.classList.add("is-dragging");
-          if (event.dataTransfer) {
-            event.dataTransfer.effectAllowed = "copy";
-            event.dataTransfer.setData("application/x-google-ai-hub-tab", tab.id);
+          if (!canvasContext || !event.dataTransfer) {
+            event.preventDefault();
+            return;
           }
+          activeTabDrag = {
+            tabId: tab.id,
+            origin: { clientX: event.clientX, clientY: event.clientY },
+            lastPoint: { clientX: event.clientX, clientY: event.clientY },
+            createNewTab: event.shiftKey,
+            handled: false
+          };
+          button.classList.add("is-dragging");
+          event.dataTransfer.effectAllowed = "copy";
+          event.dataTransfer.setData(GOOGLE_DOC_TAB_DRAG_MIME, serializeGoogleDocTabDrag({
+            documentId,
+            tabId: tab.id,
+            sourceNodeId: canvasContext.node.id
+          }));
         }, { signal: controller.signal });
         button.addEventListener("dragend", event => {
           event.stopPropagation();
           button.classList.remove("is-dragging");
-          const distance = dragOrigin
-            ? Math.hypot(event.clientX - dragOrigin.x, event.clientY - dragOrigin.y)
-            : 0;
-          dragOrigin = null;
-          if (distance >= 36) void createTabCardFromDrag(event, tab);
+          const state = activeTabDrag?.tabId === tab.id ? activeTabDrag : null;
+          activeTabDrag = null;
+          if (!state || state.handled) return;
+          const point = event.clientX > 0 && event.clientY > 0
+            ? { clientX: event.clientX, clientY: event.clientY }
+            : state.lastPoint;
+          const distance = Math.hypot(
+            point.clientX - state.origin.clientX,
+            point.clientY - state.origin.clientY
+          );
+          if (distance < 36) return;
+          if (state.createNewTab || event.shiftKey) void createNewTabCardFromDrop(point, tab);
+          else void createExistingTabCardFromDrop(point, tab);
         }, { signal: controller.signal });
         tabsBar.appendChild(button);
       }
@@ -2332,30 +2388,76 @@ export default class GoogleAiHubPlugin extends Plugin {
       }, () => createdTabId || activeTabId, "created");
     };
 
-    createTabCardFromDrag = async (event: DragEvent, sourceTab: GoogleDocTabInfo): Promise<void> => {
-      if (!nativeTabsAvailable) {
-        new Notice(tabsWarning || "Native Google Doc tabs are not available yet.", 9000);
-        return;
-      }
-      if (!canvasContext?.node.nodeEl || event.clientX <= 0 || event.clientY <= 0) return;
-
+    const isValidCanvasDrop = (point: { clientX: number; clientY: number }): boolean => {
+      if (!canvasContext?.node.nodeEl || point.clientX <= 0 || point.clientY <= 0) return false;
       const canvasLeaf = canvasContext.node.nodeEl.closest<HTMLElement>(".workspace-leaf-content");
       const canvasBounds = canvasLeaf?.getBoundingClientRect();
       if (
         !canvasBounds
-        || event.clientX < canvasBounds.left
-        || event.clientX > canvasBounds.right
-        || event.clientY < canvasBounds.top
-        || event.clientY > canvasBounds.bottom
-      ) return;
+        || point.clientX < canvasBounds.left
+        || point.clientX > canvasBounds.right
+        || point.clientY < canvasBounds.top
+        || point.clientY > canvasBounds.bottom
+      ) return false;
 
       const sourceBounds = canvasContext.node.nodeEl.getBoundingClientRect();
-      if (
-        event.clientX >= sourceBounds.left
-        && event.clientX <= sourceBounds.right
-        && event.clientY >= sourceBounds.top
-        && event.clientY <= sourceBounds.bottom
-      ) return;
+      return !(
+        point.clientX >= sourceBounds.left
+        && point.clientX <= sourceBounds.right
+        && point.clientY >= sourceBounds.top
+        && point.clientY <= sourceBounds.bottom
+      );
+    };
+
+    const sourceCanvasFile = (): { data: CanvasFileNodeData; file: TFile } | null => {
+      if (!canvasContext) return null;
+      const data = canvasContext.node.getData();
+      const file = canvasContext.node.file || this.app.vault.getAbstractFileByPath(data.file);
+      return file instanceof TFile ? { data, file } : null;
+    };
+
+    createExistingTabCardFromDrop = async (point, sourceTab): Promise<void> => {
+      if (!nativeTabsAvailable) {
+        new Notice(tabsWarning || "Native Google Doc tabs are not available yet.", 9000);
+        return;
+      }
+      if (!canvasContext || !isValidCanvasDrop(point)) return;
+      if (sourceTab.id === activeTabId && dirty) {
+        await saveDocument(true);
+        if (dirty) return;
+      }
+
+      const source = sourceCanvasFile();
+      if (!source) {
+        new Notice("Could not find the Google Doc shortcut for the new Canvas card.", 8000);
+        return;
+      }
+      const createdNode = canvasContext.canvas.createFileNode({
+        pos: canvasContext.canvas.posFromClient(point),
+        position: "center",
+        size: {
+          width: Math.max(300, source.data.width || 400),
+          height: Math.max(260, source.data.height || 400)
+        },
+        file: source.file,
+        subpath: googleDocTabSubpath(sourceTab.id),
+        save: true,
+        focus: true
+      });
+      if (!createdNode) {
+        new Notice("Obsidian could not create the Canvas card for this tab.", 8000);
+        return;
+      }
+      canvasContext.canvas.requestSave();
+      new Notice(`Opened ${sourceTab.title} in a new Canvas card.`, 6000);
+    };
+
+    createNewTabCardFromDrop = async (point, sourceTab): Promise<void> => {
+      if (!nativeTabsAvailable) {
+        new Notice(tabsWarning || "Native Google Doc tabs are not available yet.", 9000);
+        return;
+      }
+      if (!canvasContext || !isValidCanvasDrop(point)) return;
 
       const editor = await new TabCardEditorModal(this.app, sourceTab.title).openAndWait();
       if (!editor) return;
@@ -2364,10 +2466,8 @@ export default class GoogleAiHubPlugin extends Plugin {
         if (dirty) return;
       }
 
-      const sourceData = canvasContext.node.getData();
-      const sourceFile = canvasContext.node.file
-        || this.app.vault.getAbstractFileByPath(sourceData.file);
-      if (!(sourceFile instanceof TFile)) {
+      const source = sourceCanvasFile();
+      if (!source) {
         new Notice("Could not find the Google Doc shortcut for the new Canvas card.", 8000);
         return;
       }
@@ -2383,15 +2483,15 @@ export default class GoogleAiHubPlugin extends Plugin {
         );
         if (!createdTabId) throw new Error("Google Docs did not return the new tab ID.");
 
-        const dropPosition = canvasContext.canvas.posFromClient(event);
+        const dropPosition = canvasContext.canvas.posFromClient(point);
         const createdNode = canvasContext.canvas.createFileNode({
           pos: dropPosition,
           position: "center",
           size: {
-            width: Math.max(300, sourceData.width || 400),
-            height: Math.max(260, sourceData.height || 400)
+            width: Math.max(300, source.data.width || 400),
+            height: Math.max(260, source.data.height || 400)
           },
-          file: sourceFile,
+          file: source.file,
           subpath: googleDocTabSubpath(createdTabId),
           save: true,
           focus: true
@@ -2881,6 +2981,33 @@ export default class GoogleAiHubPlugin extends Plugin {
       }
       menu.showAtMouseEvent(event);
     }, { signal: controller.signal });
+
+    embed.ownerDocument.addEventListener("dragover", event => {
+      if (!activeTabDrag || !event.dataTransfer) return;
+      if (!Array.from(event.dataTransfer.types).includes(GOOGLE_DOC_TAB_DRAG_MIME)) return;
+      activeTabDrag.lastPoint = { clientX: event.clientX, clientY: event.clientY };
+      activeTabDrag.createNewTab = event.shiftKey;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+    }, { signal: controller.signal, capture: true });
+    embed.ownerDocument.addEventListener("drop", event => {
+      if (!activeTabDrag || !event.dataTransfer || !canvasContext) return;
+      const payload = parseGoogleDocTabDrag(event.dataTransfer.getData(GOOGLE_DOC_TAB_DRAG_MIME));
+      if (
+        !payload
+        || payload.documentId !== documentId
+        || payload.sourceNodeId !== canvasContext.node.id
+        || payload.tabId !== activeTabDrag.tabId
+      ) return;
+      const sourceTab = tabs.find(tab => tab.id === payload.tabId);
+      if (!sourceTab) return;
+      event.preventDefault();
+      event.stopPropagation();
+      activeTabDrag.handled = true;
+      const point = { clientX: event.clientX, clientY: event.clientY };
+      if (event.shiftKey || activeTabDrag.createNewTab) void createNewTabCardFromDrop(point, sourceTab);
+      else void createExistingTabCardFromDrop(point, sourceTab);
+    }, { signal: controller.signal, capture: true });
 
     controller.signal.addEventListener("abort", () => {
       renderComponent?.unload();

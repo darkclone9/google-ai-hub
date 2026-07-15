@@ -91,10 +91,12 @@ Missing keys, authentication failures, quota errors, blocked responses, oversize
 Add a `.gdoc` shortcut to Canvas to get a native Obsidian editor instead of an unreadable embedded page. Empty tabs show a temporary formatting guide that disappears on the first input and is never saved to Google Docs.
 
 - Select text normally with click-and-drag.
+- Drag the **⠿** handle in the card toolbar to move the card without entering the editor.
 - Use **Paragraph** for headings, quotes, and code; **B/I/S** for emphasis; **•/1.** for lists; and **Link** or `Ctrl+K` for links.
 - Use **Save** or `Ctrl+S` to save immediately; otherwise changes autosave after a short pause.
 - Use **+** for a root tab, double-click a tab to rename it, and right-click for move, nesting, outdent, child, and delete actions.
-- Drag a tab into an empty Canvas location to create a sibling above or below it. The new card points to the new native Google Docs tab, not a Markdown mirror.
+- Drag a tab into an empty Canvas location to create a new card pinned to that existing Google Docs tab.
+- Hold `Shift` while dragging a tab to create a brand-new sibling tab above or below it; the placement dialog appears at the drop location.
 - Creating or changing a tab broadcasts a document-scoped refresh to every open card. Other cards retain their active tab, caret, selection, and unsaved draft.
 
 Local draft recovery protects edits if Google rejects a save or Obsidian reloads before the request succeeds.
@@ -128,6 +130,10 @@ Enable the Google Docs API for the OAuth project, confirm that the signed-in acc
 ### Native tabs say setup is needed
 
 Confirm that the Google Docs API is enabled and reconnect. The Canvas editor retains text as a local draft until tab editing is available.
+
+### A Google Doc Canvas card will not move
+
+Drag the **⠿** handle at the left of the card toolbar. The document body remains reserved for text selection and editing, while the handle uses Obsidian's native Canvas movement surface.
 
 ### Gemini says the key is missing or invalid
 
