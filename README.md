@@ -135,6 +135,8 @@ Confirm that the Google Docs API is enabled and reconnect. The Canvas editor ret
 
 Drag the **⠿** handle at the left of the card toolbar. The document body remains reserved for text selection and editing, while the handle uses Obsidian's native Canvas movement surface.
 
+If a tab drag previously produced an invisible empty node or dangling connector, reload the plugin. Google AI Hub repairs malformed text nodes that contain Google Doc tab metadata, preserving their position and existing Canvas edges.
+
 ### Gemini says the key is missing or invalid
 
 Re-enter the key in Obsidian Secret Storage, verify that the configured model is available to the key, and check Gemini quota or billing. The source is not modified on failure.

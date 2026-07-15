@@ -51,7 +51,9 @@ import {
 import { GoogleDocTabSyncRegistry, type GoogleDocTabChange } from "./tab-sync";
 import {
   GOOGLE_DOC_TAB_DRAG_MIME,
+  canvasPositionClientPoint,
   parseGoogleDocTabDrag,
+  repairMalformedGoogleDocTabNode,
   serializeGoogleDocTabDrag
 } from "./canvas-tab-drag";
 
@@ -788,7 +790,7 @@ interface CanvasRuntime {
   getData(): CanvasRuntimeData;
   getSelectionData(): CanvasRuntimeData;
   setData(data: CanvasRuntimeData): void | Promise<void>;
-  posFromClient(event: { clientX: number; clientY: number }): { x: number; y: number };
+  posFromClient(point: { x: number; y: number }): { x: number; y: number };
   createFileNode(options: {
     pos: { x: number; y: number };
     position: "center";
@@ -1570,6 +1572,7 @@ export default class GoogleAiHubPlugin extends Plugin {
   private canvasGoogleDocObserver: MutationObserver | null = null;
   private readonly canvasGoogleDocEmbeds = new Map<CanvasGoogleDocWebview, AbortController>();
   private readonly canvasGoogleDocConnectorActions = new Map<CanvasRuntimeNode, CanvasGoogleDocConnectorAction>();
+  private readonly canvasGoogleDocRepairInFlight = new WeakSet<CanvasRuntime>();
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -1778,6 +1781,7 @@ export default class GoogleAiHubPlugin extends Plugin {
   }
 
   private refreshCanvasGoogleDocPreviews(): void {
+    this.repairMalformedCanvasGoogleDocTabNodes();
     for (const [webview, controller] of this.canvasGoogleDocEmbeds) {
       if (webview.isConnected && webview.closest(".canvas-node")) continue;
       controller.abort();
@@ -1789,6 +1793,31 @@ export default class GoogleAiHubPlugin extends Plugin {
     ));
     for (const webview of webviews) {
       this.setupCanvasGoogleDocPreview(webview);
+    }
+  }
+
+  private repairMalformedCanvasGoogleDocTabNodes(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType("canvas")) {
+      const canvas = (leaf.view as unknown as CanvasRuntimeView).canvas;
+      if (!canvas || this.canvasGoogleDocRepairInFlight.has(canvas)) continue;
+      const data = canvas.getData();
+      const repairedNodes = data.nodes.map(repairMalformedGoogleDocTabNode);
+      const repairedCount = repairedNodes.reduce(
+        (count, node, index) => count + (node === data.nodes[index] ? 0 : 1),
+        0
+      );
+      if (!repairedCount) continue;
+
+      this.canvasGoogleDocRepairInFlight.add(canvas);
+      void Promise.resolve(canvas.setData({ ...data, nodes: repairedNodes }))
+        .then(() => {
+          canvas.requestSave();
+          new Notice(`Repaired ${repairedCount} malformed Google Doc tab card${repairedCount === 1 ? "" : "s"}.`, 7000);
+        })
+        .catch(error => {
+          new Notice(`Could not repair a malformed Canvas card: ${this.errorMessage(error)}`, 9000);
+        })
+        .finally(() => this.canvasGoogleDocRepairInFlight.delete(canvas));
     }
   }
 
@@ -2433,7 +2462,7 @@ export default class GoogleAiHubPlugin extends Plugin {
         return;
       }
       const createdNode = canvasContext.canvas.createFileNode({
-        pos: canvasContext.canvas.posFromClient(point),
+        pos: canvasContext.canvas.posFromClient(canvasPositionClientPoint(point)),
         position: "center",
         size: {
           width: Math.max(300, source.data.width || 400),
@@ -2483,7 +2512,7 @@ export default class GoogleAiHubPlugin extends Plugin {
         );
         if (!createdTabId) throw new Error("Google Docs did not return the new tab ID.");
 
-        const dropPosition = canvasContext.canvas.posFromClient(point);
+        const dropPosition = canvasContext.canvas.posFromClient(canvasPositionClientPoint(point));
         const createdNode = canvasContext.canvas.createFileNode({
           pos: dropPosition,
           position: "center",

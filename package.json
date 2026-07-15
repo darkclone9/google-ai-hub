@@ -1,6 +1,6 @@
 {
   "name": "obsidian-google-ai-hub",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "private": true,
   "description": "An Obsidian workspace for NotebookLM, Gemini, Google Drive, and Google Docs.",
   "license": "MIT",
