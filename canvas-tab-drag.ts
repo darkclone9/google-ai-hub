@@ -21,7 +21,28 @@ export type CanvasDataNode = Record<string, unknown> & {
   type: string;
 };
 
+export type CanvasDataEdge = Record<string, unknown>;
+
+export interface RepairableCanvasData {
+  nodes: CanvasDataNode[];
+  edges: CanvasDataEdge[];
+}
+
+export interface CanvasDataSetter {
+  setData(data: RepairableCanvasData): void | Promise<void>;
+}
+
 const GOOGLE_DOC_TAB_SUBPATH_PREFIX = "#google-ai-hub-tab=";
+
+export class CanvasRepairAttemptRegistry {
+  private readonly attempted = new WeakSet<object>();
+
+  claim(canvas: object): boolean {
+    if (this.attempted.has(canvas)) return false;
+    this.attempted.add(canvas);
+    return true;
+  }
+}
 
 export function canvasPositionClientPoint(point: CanvasClientPoint): CanvasPosition {
   return { x: point.clientX, y: point.clientY };
@@ -44,6 +65,31 @@ export function repairMalformedGoogleDocTabNode(node: CanvasDataNode): CanvasDat
   delete repaired.text;
   delete repaired.url;
   return repaired;
+}
+
+export async function repairMalformedGoogleDocTabCards(
+  canvas: CanvasDataSetter,
+  data: RepairableCanvasData
+): Promise<number> {
+  const repairedIds = new Set<string>();
+  const repairedNodes = data.nodes.map(node => {
+    const repaired = repairMalformedGoogleDocTabNode(node);
+    if (repaired !== node) repairedIds.add(node.id);
+    return repaired;
+  });
+  if (!repairedIds.size) return 0;
+
+  const intermediate: RepairableCanvasData = {
+    ...data,
+    nodes: data.nodes.filter(node => !repairedIds.has(node.id)),
+    edges: data.edges.filter(edge =>
+      !repairedIds.has(String(edge.fromNode || ""))
+      && !repairedIds.has(String(edge.toNode || ""))
+    )
+  };
+  await Promise.resolve(canvas.setData(intermediate));
+  await Promise.resolve(canvas.setData({ ...data, nodes: repairedNodes }));
+  return repairedIds.size;
 }
 
 export function serializeGoogleDocTabDrag(payload: GoogleDocTabDragPayload): string {

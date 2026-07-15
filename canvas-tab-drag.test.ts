@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  CanvasRepairAttemptRegistry,
   canvasPositionClientPoint,
   parseGoogleDocTabDrag,
+  repairMalformedGoogleDocTabCards,
   repairMalformedGoogleDocTabNode,
   serializeGoogleDocTabDrag
 } from "./canvas-tab-drag";
@@ -45,5 +47,41 @@ describe("Canvas Google Doc tab drag payload", () => {
     });
     const ordinary = { id: "node-2", type: "text", text: "Keep me" };
     expect(repairMalformedGoogleDocTabNode(ordinary)).toBe(ordinary);
+  });
+
+  it("allows only one automatic repair attempt per loaded Canvas", () => {
+    const registry = new CanvasRepairAttemptRegistry();
+    const firstCanvas = {};
+    const secondCanvas = {};
+    expect(registry.claim(firstCanvas)).toBe(true);
+    expect(registry.claim(firstCanvas)).toBe(false);
+    expect(registry.claim(secondCanvas)).toBe(true);
+  });
+
+  it("recreates malformed nodes so Obsidian changes their runtime type", async () => {
+    const setData = vi.fn();
+    const data = {
+      nodes: [{
+        id: "broken",
+        type: "text",
+        text: "",
+        file: "Google Docs/example.gdoc",
+        subpath: "#google-ai-hub-tab=tab-2",
+        width: 250,
+        height: 60
+      }, { id: "source", type: "file" }],
+      edges: [{ id: "edge-1", fromNode: "source", toNode: "broken" }]
+    };
+
+    await expect(repairMalformedGoogleDocTabCards({ setData }, data)).resolves.toBe(1);
+    expect(setData).toHaveBeenCalledTimes(2);
+    expect(setData.mock.calls[0][0]).toEqual({
+      nodes: [{ id: "source", type: "file" }],
+      edges: []
+    });
+    expect(setData.mock.calls[1][0]).toEqual({
+      nodes: [expect.objectContaining({ id: "broken", type: "file", width: 300, height: 260 }), { id: "source", type: "file" }],
+      edges: [{ id: "edge-1", fromNode: "source", toNode: "broken" }]
+    });
   });
 });

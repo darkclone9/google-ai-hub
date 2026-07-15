@@ -50,10 +50,11 @@ import {
 } from "./gemini-ai";
 import { GoogleDocTabSyncRegistry, type GoogleDocTabChange } from "./tab-sync";
 import {
+  CanvasRepairAttemptRegistry,
   GOOGLE_DOC_TAB_DRAG_MIME,
   canvasPositionClientPoint,
   parseGoogleDocTabDrag,
-  repairMalformedGoogleDocTabNode,
+  repairMalformedGoogleDocTabCards,
   serializeGoogleDocTabDrag
 } from "./canvas-tab-drag";
 
@@ -1570,9 +1571,10 @@ export default class GoogleAiHubPlugin extends Plugin {
   readonly tabSync = new GoogleDocTabSyncRegistry();
   googleConnected = false;
   private canvasGoogleDocObserver: MutationObserver | null = null;
+  private canvasGoogleDocRefreshTimer: number | null = null;
   private readonly canvasGoogleDocEmbeds = new Map<CanvasGoogleDocWebview, AbortController>();
   private readonly canvasGoogleDocConnectorActions = new Map<CanvasRuntimeNode, CanvasGoogleDocConnectorAction>();
-  private readonly canvasGoogleDocRepairInFlight = new WeakSet<CanvasRuntime>();
+  private readonly canvasGoogleDocRepairAttempts = new CanvasRepairAttemptRegistry();
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -1749,9 +1751,8 @@ export default class GoogleAiHubPlugin extends Plugin {
   private enableCanvasGoogleDocPreviews(): void {
     this.disableCanvasGoogleDocPreviews();
 
-    this.canvasGoogleDocObserver = new MutationObserver(() => {
-      this.refreshCanvasGoogleDocPreviews();
-      this.refreshCanvasGoogleDocConnectorMenus();
+    this.canvasGoogleDocObserver = new MutationObserver(records => {
+      if (this.canvasMutationNeedsRefresh(records)) this.scheduleCanvasGoogleDocRefresh();
     });
     this.canvasGoogleDocObserver.observe(document.body, { childList: true, subtree: true });
     this.refreshCanvasGoogleDocPreviews();
@@ -1761,6 +1762,10 @@ export default class GoogleAiHubPlugin extends Plugin {
   private disableCanvasGoogleDocPreviews(): void {
     this.canvasGoogleDocObserver?.disconnect();
     this.canvasGoogleDocObserver = null;
+    if (this.canvasGoogleDocRefreshTimer !== null) {
+      window.clearTimeout(this.canvasGoogleDocRefreshTimer);
+      this.canvasGoogleDocRefreshTimer = null;
+    }
 
     for (const [webview, controller] of this.canvasGoogleDocEmbeds) {
       controller.abort();
@@ -1778,6 +1783,32 @@ export default class GoogleAiHubPlugin extends Plugin {
     this.canvasGoogleDocEmbeds.clear();
     this.canvasGoogleDocConnectorActions.clear();
     document.querySelectorAll(".google-ai-hub-gdoc-connector-add").forEach(element => element.remove());
+  }
+
+  private canvasMutationNeedsRefresh(records: MutationRecord[]): boolean {
+    const relevant = (node: Node): boolean => {
+      if (!(node instanceof Element)) return false;
+      if (node.matches(".canvas-node, .gdocs-webview, .gdocs-embed, .menu, .popover")) return true;
+      if (node.querySelector(".canvas-node, .gdocs-webview, .gdocs-embed")) return true;
+      const text = (node.textContent || "").replace(/\s+/g, " ").trim();
+      return text === "Add card"
+        || text === "Add note from vault"
+        || (text.includes("Add card") && text.includes("Add note from vault"));
+    };
+    return records.some(record =>
+      Array.from(record.addedNodes).some(relevant)
+      || Array.from(record.removedNodes).some(relevant)
+    );
+  }
+
+  private scheduleCanvasGoogleDocRefresh(): void {
+    if (this.canvasGoogleDocRefreshTimer !== null) return;
+    this.canvasGoogleDocRefreshTimer = window.setTimeout(() => {
+      this.canvasGoogleDocRefreshTimer = null;
+      if (!this.canvasGoogleDocObserver) return;
+      this.refreshCanvasGoogleDocPreviews();
+      this.refreshCanvasGoogleDocConnectorMenus();
+    }, 100);
   }
 
   private refreshCanvasGoogleDocPreviews(): void {
@@ -1799,25 +1830,17 @@ export default class GoogleAiHubPlugin extends Plugin {
   private repairMalformedCanvasGoogleDocTabNodes(): void {
     for (const leaf of this.app.workspace.getLeavesOfType("canvas")) {
       const canvas = (leaf.view as unknown as CanvasRuntimeView).canvas;
-      if (!canvas || this.canvasGoogleDocRepairInFlight.has(canvas)) continue;
+      if (!canvas || !this.canvasGoogleDocRepairAttempts.claim(canvas)) continue;
       const data = canvas.getData();
-      const repairedNodes = data.nodes.map(repairMalformedGoogleDocTabNode);
-      const repairedCount = repairedNodes.reduce(
-        (count, node, index) => count + (node === data.nodes[index] ? 0 : 1),
-        0
-      );
-      if (!repairedCount) continue;
-
-      this.canvasGoogleDocRepairInFlight.add(canvas);
-      void Promise.resolve(canvas.setData({ ...data, nodes: repairedNodes }))
-        .then(() => {
+      void repairMalformedGoogleDocTabCards(canvas, data)
+        .then(repairedCount => {
+          if (!repairedCount) return;
           canvas.requestSave();
           new Notice(`Repaired ${repairedCount} malformed Google Doc tab card${repairedCount === 1 ? "" : "s"}.`, 7000);
         })
         .catch(error => {
           new Notice(`Could not repair a malformed Canvas card: ${this.errorMessage(error)}`, 9000);
-        })
-        .finally(() => this.canvasGoogleDocRepairInFlight.delete(canvas));
+        });
     }
   }
 
