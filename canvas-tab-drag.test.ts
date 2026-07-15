@@ -63,6 +63,14 @@ describe("Canvas Google Doc tab drag payload", () => {
     });
     const ordinary = { id: "node-2", type: "text", text: "Keep me" };
     expect(repairMalformedGoogleDocTabNode(ordinary)).toBe(ordinary);
+    const unsyncedDraft = {
+      id: "node-3",
+      type: "text",
+      text: "Classes:",
+      file: "Google Docs/example.gdoc",
+      subpath: "#google-ai-hub-tab=tab-3"
+    };
+    expect(repairMalformedGoogleDocTabNode(unsyncedDraft)).toBe(unsyncedDraft);
   });
 
   it("allows only one automatic repair attempt per loaded Canvas", () => {

@@ -108,6 +108,7 @@ export async function recreateCanvasNodeAsGoogleDocTabCard(
 export function repairMalformedGoogleDocTabNode(node: CanvasDataNode): CanvasDataNode {
   if (
     node.type !== "text"
+    || (typeof node.text === "string" && node.text.trim().length > 0)
     || typeof node.file !== "string"
     || typeof node.subpath !== "string"
     || !node.subpath.startsWith(GOOGLE_DOC_TAB_SUBPATH_PREFIX)

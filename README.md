@@ -143,7 +143,7 @@ Confirm that the Google Docs API is enabled and reconnect. The Canvas editor ret
 
 Drag the **⠿** handle at the left of the card toolbar. The document body remains reserved for text selection and editing, while the handle uses Obsidian's native Canvas movement surface.
 
-If a tab drag previously produced an invisible empty node or dangling connector, reload the plugin. Google AI Hub makes one repair attempt per loaded Canvas, preserving the card position and existing edges without repeatedly reacting to its own DOM updates.
+If a tab drag previously produced an invisible empty node or dangling connector, reload the plugin. Google AI Hub makes one repair attempt per loaded Canvas, preserving the card position and existing edges without repeatedly reacting to its own DOM updates. A malformed card containing typed text is deliberately left unchanged so the unsynced draft cannot be discarded; copy that text before deleting and recreating the card.
 
 ### Gemini says the key is missing or invalid
 
