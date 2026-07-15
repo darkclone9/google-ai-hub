@@ -35,7 +35,12 @@ export function repairMalformedGoogleDocTabNode(node: CanvasDataNode): CanvasDat
     || !node.subpath.startsWith(GOOGLE_DOC_TAB_SUBPATH_PREFIX)
   ) return node;
 
-  const repaired: CanvasDataNode = { ...node, type: "file" };
+  const repaired: CanvasDataNode = {
+    ...node,
+    type: "file",
+    width: Math.max(300, typeof node.width === "number" ? node.width : 400),
+    height: Math.max(260, typeof node.height === "number" ? node.height : 400)
+  };
   delete repaired.text;
   delete repaired.url;
   return repaired;

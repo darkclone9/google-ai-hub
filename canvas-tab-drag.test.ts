@@ -30,14 +30,18 @@ describe("Canvas Google Doc tab drag payload", () => {
       file: "Google Docs/example.gdoc",
       subpath: "#google-ai-hub-tab=tab-2",
       x: 10,
-      y: 20
+      y: 20,
+      width: 250,
+      height: 60
     })).toEqual({
       id: "node-1",
       type: "file",
       file: "Google Docs/example.gdoc",
       subpath: "#google-ai-hub-tab=tab-2",
       x: 10,
-      y: 20
+      y: 20,
+      width: 300,
+      height: 260
     });
     const ordinary = { id: "node-2", type: "text", text: "Keep me" };
     expect(repairMalformedGoogleDocTabNode(ordinary)).toBe(ordinary);
