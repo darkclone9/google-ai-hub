@@ -3,6 +3,7 @@ import {
   CanvasRepairAttemptRegistry,
   canvasPositionClientPoint,
   chooseCanvasConnectorCandidate,
+  findNewConnectedMarkdownNode,
   parseGoogleDocTabDrag,
   recreateCanvasNodeAsGoogleDocTabCard,
   repairMalformedGoogleDocTabCards,
@@ -38,6 +39,25 @@ describe("Canvas Google Doc tab drag payload", () => {
       { value: "first", isConnectorSource: false, isSelected: true },
       { value: "second", isConnectorSource: false, isSelected: true }
     ])).toBeNull();
+  });
+
+  it("finds only a newly connected Markdown file node from the selected source", () => {
+    const data = {
+      nodes: [
+        { id: "source", type: "file", file: "Google Docs/source.gdoc" },
+        { id: "old-note", type: "file", file: "Notes/Old.md" },
+        { id: "new-note", type: "file", file: "Notes/Viralist.md" },
+        { id: "other", type: "file", file: "Notes/Other.md" }
+      ],
+      edges: [
+        { fromNode: "source", toNode: "old-note" },
+        { fromNode: "source", toNode: "new-note" },
+        { fromNode: "another-source", toNode: "other" }
+      ]
+    };
+    expect(findNewConnectedMarkdownNode(data, "source", new Set(["source", "old-note"])))
+      .toEqual({ id: "new-note", type: "file", file: "Notes/Viralist.md" });
+    expect(findNewConnectedMarkdownNode(data, "missing", new Set())).toBeNull();
   });
 
   it("repairs empty text nodes that were intended to be Google Doc tab cards", () => {

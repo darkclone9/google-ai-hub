@@ -55,6 +55,7 @@ import {
   GOOGLE_DOC_TAB_DRAG_MIME,
   canvasPositionClientPoint,
   chooseCanvasConnectorCandidate,
+  findNewConnectedMarkdownNode,
   parseGoogleDocTabDrag,
   recreateCanvasNodeAsGoogleDocTabCard,
   repairMalformedGoogleDocTabCards,
@@ -820,6 +821,7 @@ interface CanvasRuntimeContext {
 
 interface CanvasGoogleDocConnectorAction extends CanvasRuntimeContext {
   createTabCard(addCardButton: HTMLElement): Promise<void>;
+  captureNoteCard(): void;
 }
 
 const GOOGLE_DOC_TAB_SUBPATH_PREFIX = "#google-ai-hub-tab=";
@@ -1892,7 +1894,7 @@ export default class GoogleAiHubPlugin extends Plugin {
         if (addNoteButton) break;
         menu = menu.parentElement;
       }
-      if (!menu || !addNoteButton || menu.querySelector(".google-ai-hub-gdoc-connector-add")) continue;
+      if (!menu || !addNoteButton) continue;
 
       const candidates = Array.from(this.canvasGoogleDocConnectorActions.values()).map(candidate => {
         let isConnectorSource = false;
@@ -1914,6 +1916,13 @@ export default class GoogleAiHubPlugin extends Plugin {
       });
       const action = chooseCanvasConnectorCandidate(candidates);
       if (!action) continue;
+
+      if (!addNoteButton.classList.contains("google-ai-hub-gdoc-connector-note")) {
+        addNoteButton.classList.add("google-ai-hub-gdoc-connector-note");
+        addNoteButton.setAttribute("title", "Add a note as a child Google Doc tab");
+        addNoteButton.addEventListener("click", () => action.captureNoteCard(), { capture: true });
+      }
+      if (menu.querySelector(".google-ai-hub-gdoc-connector-add")) continue;
 
       const addTabButton = addCardButton.cloneNode(true) as HTMLElement;
       addTabButton.classList.add("google-ai-hub-gdoc-connector-add");
@@ -2112,6 +2121,7 @@ export default class GoogleAiHubPlugin extends Plugin {
       tab: GoogleDocTabInfo
     ) => Promise<void> = async () => {};
     let createTabCardFromConnector: (addCardButton: HTMLElement) => Promise<void> = async () => {};
+    let captureNoteCardFromConnector: () => void = () => {};
     let activeTabDrag: {
       tabId: string;
       origin: { clientX: number; clientY: number };
@@ -2679,6 +2689,89 @@ export default class GoogleAiHubPlugin extends Plugin {
       }
     };
 
+    let connectorNoteCaptureInFlight = false;
+    captureNoteCardFromConnector = (): void => {
+      if (connectorNoteCaptureInFlight || !nativeTabsAvailable || !canvasContext) return;
+      const sourceTab = tabs.find(tab => tab.id === activeTabId);
+      const source = sourceCanvasFile();
+      if (!sourceTab || !source) return;
+
+      const canvas = canvasContext.canvas;
+      const knownNodeIds = new Set(canvas.getData().nodes.map(node => node.id));
+      connectorNoteCaptureInFlight = true;
+      void (async () => {
+        let createdTabId = "";
+        let cardRecreated = false;
+        try {
+          let targetData: (Record<string, unknown> & { id: string; type: string }) | null = null;
+          for (let attempt = 0; attempt < 240 && !targetData; attempt += 1) {
+            targetData = findNewConnectedMarkdownNode(
+              canvas.getData(),
+              canvasContext.node.id,
+              knownNodeIds
+            );
+            if (!targetData) await new Promise<void>(resolve => window.setTimeout(resolve, 250));
+          }
+          if (!targetData || typeof targetData.file !== "string") return;
+
+          const note = this.app.vault.getAbstractFileByPath(targetData.file);
+          if (!(note instanceof TFile) || note.extension !== "md") return;
+          this.clearAutomaticNotePublishTimer(note);
+          this.pendingAutoPublishNotes.delete(note);
+          if (dirty) {
+            await saveDocument(true);
+            if (dirty) return;
+          }
+
+          const markdown = await this.app.vault.cachedRead(note);
+          setSaveState("Creating child tab…", "saving");
+          const childIndex = tabs.filter(tab => tab.parentTabId === sourceTab.id).length;
+          createdTabId = await this.driveBridge.addGoogleDocTab(
+            documentId,
+            note.basename,
+            sourceTab.id,
+            "",
+            childIndex
+          );
+          if (!createdTabId) throw new Error("Google Docs did not return the new child tab ID.");
+          if (markdown.trim()) {
+            await this.driveBridge.updateGoogleDocTabContent(
+              documentId,
+              createdTabId,
+              await this.markdownToGoogleDocUpdate(markdown, note.path)
+            );
+          }
+
+          const recreated = await recreateCanvasNodeAsGoogleDocTabCard(
+            canvas,
+            canvas.getData(),
+            targetData.id,
+            source.file.path,
+            googleDocTabSubpath(createdTabId)
+          );
+          if (!recreated) throw new Error("Obsidian could not replace the note with a Google Doc tab card.");
+          cardRecreated = true;
+          canvas.requestSave();
+          this.scheduleCanvasGoogleDocRefresh();
+          await this.tabSync.notify({ documentId, kind: "created", tabId: createdTabId });
+          await renderDocument(true);
+          new Notice(`Created ${note.basename} under ${sourceTab.title} and opened its Google Doc interface.`, 8000);
+        } catch (error) {
+          if (createdTabId && !cardRecreated) {
+            try {
+              await this.driveBridge.deleteGoogleDocTab(documentId, createdTabId);
+            } catch {
+              // Preserve the original Markdown card even if rollback also fails.
+            }
+          }
+          setSaveState(dirty ? "Unsaved draft" : "Saved", dirty ? "dirty" : "saved");
+          new Notice(`Could not turn the connected note into a Google Doc tab: ${this.errorMessage(error)}`, 10000);
+        } finally {
+          connectorNoteCaptureInFlight = false;
+        }
+      })();
+    };
+
     const editTab = async (tab: GoogleDocTabInfo): Promise<void> => {
       const editor = await new TabEditorModal(
         this.app,
@@ -3162,7 +3255,8 @@ export default class GoogleAiHubPlugin extends Plugin {
     if (canvasContext) {
       const connectorAction: CanvasGoogleDocConnectorAction = {
         ...canvasContext,
-        createTabCard: addCardButton => createTabCardFromConnector(addCardButton)
+        createTabCard: addCardButton => createTabCardFromConnector(addCardButton),
+        captureNoteCard: () => captureNoteCardFromConnector()
       };
       this.canvasGoogleDocConnectorActions.set(canvasContext.node, connectorAction);
       controller.signal.addEventListener("abort", () => {

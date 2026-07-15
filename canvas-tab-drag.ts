@@ -68,6 +68,23 @@ export function chooseCanvasConnectorCandidate<T>(
   return selected.length === 1 ? selected[0].value : null;
 }
 
+export function findNewConnectedMarkdownNode(
+  data: RepairableCanvasData,
+  sourceNodeId: string,
+  knownNodeIds: ReadonlySet<string>
+): CanvasDataNode | null {
+  const connectedTargetIds = new Set(data.edges
+    .filter(edge => String(edge.fromNode || "") === sourceNodeId)
+    .map(edge => String(edge.toNode || ""))
+    .filter(nodeId => nodeId && !knownNodeIds.has(nodeId)));
+  return data.nodes.find(node =>
+    connectedTargetIds.has(node.id)
+    && node.type === "file"
+    && typeof node.file === "string"
+    && /\.md$/i.test(node.file)
+  ) || null;
+}
+
 export async function recreateCanvasNodeAsGoogleDocTabCard(
   canvas: CanvasDataSetter,
   data: RepairableCanvasData,
