@@ -4,6 +4,8 @@ import {
   buildAiPrompt,
   cleanGeminiMarkdown,
   isSourceCurrent,
+  mergeGeminiModels,
+  parseGeminiModelList,
   resolveGeminiKey,
   sourceHash
 } from "./gemini-ai";
@@ -49,5 +51,70 @@ describe("Gemini AI helpers", () => {
     );
     await expect(client.generate({ action: "summarize", title: "Test", markdown: "Source" }))
       .rejects.toThrow("quota was exceeded");
+  });
+
+  it("filters account models to text generation choices", () => {
+    const models = parseGeminiModelList({
+      models: [
+        { name: "models/gemini-writing", displayName: "Writing", supportedGenerationMethods: ["generateContent"] },
+        { name: "models/text-embedding", displayName: "Embedding", supportedGenerationMethods: ["embedContent"] }
+      ]
+    });
+    expect(models).toEqual([expect.objectContaining({ id: "gemini-writing", displayName: "Writing" })]);
+  });
+
+  it("keeps recommended, discovered, and custom models available", () => {
+    const models = mergeGeminiModels(
+      [{ id: "models/account-model", displayName: "Account model", description: "Available" }],
+      ["custom-model"]
+    );
+    expect(models.map(model => model.id)).toEqual(expect.arrayContaining([
+      "gemini-3.1-pro-preview",
+      "gemini-3.5-flash",
+      "account-model",
+      "custom-model"
+    ]));
+  });
+
+  it("uses a per-request model override", async () => {
+    let requestedUrl = "";
+    const client = new GeminiAiClient(
+      {
+        post: async url => {
+          requestedUrl = url;
+          return { candidates: [{ content: { parts: [{ text: "Result" }] } }] };
+        }
+      },
+      () => "key",
+      () => "gemini-3.5-flash"
+    );
+    const result = await client.generate({
+      action: "elaborate",
+      title: "Test",
+      markdown: "Source",
+      model: "models/gemini-3.1-pro-preview"
+    });
+    expect(requestedUrl).toContain("gemini-3.1-pro-preview");
+    expect(result.model).toBe("gemini-3.1-pro-preview");
+  });
+
+  it("discovers models available to the current API key", async () => {
+    const client = new GeminiAiClient(
+      {
+        post: async () => ({}),
+        get: async () => ({
+          models: [{
+            name: "models/gemini-account-model",
+            displayName: "Account model",
+            supportedGenerationMethods: ["generateContent"]
+          }]
+        })
+      },
+      () => "key",
+      () => "gemini-3.5-flash"
+    );
+    await expect(client.listModels()).resolves.toEqual([
+      expect.objectContaining({ id: "gemini-account-model", displayName: "Account model" })
+    ]);
   });
 });

@@ -38,12 +38,15 @@ import {
   DEFAULT_GEMINI_MODEL,
   GeminiAiClient,
   isSourceCurrent,
+  mergeGeminiModels,
+  normalizeGeminiModelId,
   resolveGeminiKey,
   sourceHash,
   type AiDocumentSource,
   type AiResult,
   type AiWritingAction,
-  type DocumentAiAdapter
+  type DocumentAiAdapter,
+  type GeminiModelInfo
 } from "./gemini-ai";
 import { GoogleDocTabSyncRegistry, type GoogleDocTabChange } from "./tab-sync";
 
@@ -62,6 +65,7 @@ interface GoogleAiHubSettings {
   googleDocsFolder: string;
   autoSyncGoogleDocs: boolean;
   geminiModel: string;
+  geminiKnownModels: GeminiModelInfo[];
   googleDocShortcuts: Record<string, string>;
   noteMirrors: Record<string, NoteMirror>;
   folderMirrors: Record<string, NoteMirror>;
@@ -461,6 +465,53 @@ class GoogleDocTabPickerModal extends FuzzySuggestModal<GoogleDocTabInfo> {
   }
 }
 
+class GeminiModelPickerModal extends FuzzySuggestModal<GeminiModelInfo> {
+  private resolver: ((model: GeminiModelInfo | null) => void) | null = null;
+  private settled = false;
+
+  constructor(
+    app: App,
+    private readonly models: GeminiModelInfo[],
+    private readonly currentModel: string
+  ) {
+    super(app);
+    this.setPlaceholder("Choose a Gemini model...");
+  }
+
+  openAndWait(): Promise<GeminiModelInfo | null> {
+    return new Promise(resolve => {
+      this.resolver = resolve;
+      this.open();
+    });
+  }
+
+  getItems(): GeminiModelInfo[] {
+    return this.models;
+  }
+
+  getItemText(model: GeminiModelInfo): string {
+    const current = model.id === this.currentModel ? "Current - " : "";
+    return `${current}${model.displayName} (${model.id}) - ${model.description}`;
+  }
+
+  onChooseItem(model: GeminiModelInfo): void {
+    this.finish(model);
+  }
+
+  onClose(): void {
+    super.onClose();
+    if (!this.settled) this.finish(null, false);
+  }
+
+  private finish(model: GeminiModelInfo | null, close = true): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.resolver?.(model);
+    this.resolver = null;
+    if (close) this.close();
+  }
+}
+
 class AiResultModal extends Modal {
   private resolver: ((choice: AiResultChoice | null) => void) | null = null;
   private settled = false;
@@ -470,7 +521,8 @@ class AiResultModal extends Modal {
     private readonly action: AiWritingAction,
     private readonly original: string,
     private readonly result: string,
-    private readonly canWrite: boolean
+    private readonly canWrite: boolean,
+    private readonly model = ""
   ) {
     super(app);
   }
@@ -485,6 +537,12 @@ class AiResultModal extends Modal {
   onOpen(): void {
     this.titleEl.setText(`AI ${this.action === "briefing" ? "briefing report" : this.action}`);
     this.contentEl.empty();
+    if (this.model) {
+      this.contentEl.createEl("p", {
+        cls: "google-ai-hub-ai-model-used",
+        text: `Generated with ${this.model}`
+      });
+    }
     const comparison = this.contentEl.createDiv({ cls: "google-ai-hub-ai-comparison" });
     for (const [label, value] of [["Original", this.original], ["AI result", this.result]] as const) {
       const column = comparison.createDiv({ cls: "google-ai-hub-ai-comparison-column" });
@@ -775,6 +833,7 @@ const DEFAULT_SETTINGS: GoogleAiHubSettings = {
   googleDocsFolder: "Google Docs",
   autoSyncGoogleDocs: true,
   geminiModel: DEFAULT_GEMINI_MODEL,
+  geminiKnownModels: [],
   googleDocShortcuts: {},
   noteMirrors: {},
   folderMirrors: {}
@@ -911,6 +970,7 @@ class GoogleAiHubView extends ItemView {
   private aiSourceInitialized = false;
   private aiOutput = "";
   private aiOutputSourceHash = "";
+  private aiOutputModel = "";
   private aiBusy = false;
   private chatHistory: Array<{ role: "user" | "model"; text: string }> = [];
 
@@ -1042,6 +1102,26 @@ class GoogleAiHubView extends ItemView {
           : "Detecting the active document..."
       });
     }
+    const modelRow = sourceCard.createDiv({ cls: "google-ai-hub-model-row" });
+    modelRow.createEl("label", { text: "AI model" });
+    const modelSelect = modelRow.createEl("select");
+    modelSelect.setAttribute("aria-label", "Gemini model for AI Hub");
+    for (const model of this.plugin.getGeminiModels()) {
+      const option = modelSelect.createEl("option", { text: model.displayName });
+      option.value = model.id;
+      option.title = `${model.id} - ${model.description}`;
+    }
+    modelSelect.value = this.plugin.settings.geminiModel;
+    modelSelect.addEventListener("change", () => {
+      void this.plugin.setGeminiModel(modelSelect.value).then(() => {
+        this.aiOutput = "";
+        this.aiOutputModel = "";
+        this.chatHistory = [];
+        this.render();
+      });
+    });
+    const refreshModels = modelRow.createEl("button", { text: "Refresh models", type: "button" });
+    refreshModels.addEventListener("click", () => void this.plugin.refreshGeminiModels().then(() => this.render()));
 
     const research = this.contentEl.createDiv({ cls: "google-ai-hub-research-grid" });
     const direct = research.createDiv({ cls: "google-ai-hub-research-card" });
@@ -1096,6 +1176,7 @@ class GoogleAiHubView extends ItemView {
     if (this.aiOutput) {
       const output = this.contentEl.createDiv({ cls: "google-ai-hub-output" });
       output.createEl("h2", { text: "Generated result" });
+      if (this.aiOutputModel) output.createEl("small", { text: `Model: ${this.aiOutputModel}` });
       const preview = output.createEl("textarea");
       preview.value = this.aiOutput;
       preview.readOnly = true;
@@ -1158,6 +1239,7 @@ class GoogleAiHubView extends ItemView {
     this.aiSource = source;
     this.aiOutput = "";
     this.aiOutputSourceHash = "";
+    this.aiOutputModel = "";
     this.chatHistory = [];
     this.render();
   }
@@ -1170,6 +1252,7 @@ class GoogleAiHubView extends ItemView {
       const result = await this.plugin.generateForSource(action, this.aiSource);
       this.aiOutput = result.markdown;
       this.aiOutputSourceHash = result.sourceHash;
+      this.aiOutputModel = result.model;
     } catch (error) {
       new Notice(`AI request failed: ${error instanceof Error ? error.message : String(error)}`, 10000);
     } finally {
@@ -1194,6 +1277,7 @@ class GoogleAiHubView extends ItemView {
       this.chatHistory.push({ role: "model", text: result.markdown });
       this.aiOutput = result.markdown;
       this.aiOutputSourceHash = result.sourceHash;
+      this.aiOutputModel = result.model;
     } catch (error) {
       new Notice(`Grounded chat failed: ${error instanceof Error ? error.message : String(error)}`, 10000);
     } finally {
@@ -1357,15 +1441,45 @@ class GoogleAiHubSettingTab extends PluginSettingTab {
           this.app.secretStorage.setSecret(GEMINI_SECRET_ID, "");
           this.display();
         }));
+    const currentModel = this.plugin.getGeminiModels()
+      .find(model => model.id === this.plugin.settings.geminiModel);
     new Setting(containerEl)
-      .setName("Gemini model")
-      .setDesc("REST model name used for document AI. The default is the stable Gemini Flash model selected by this plugin release.")
+      .setName("Default Gemini model")
+      .setDesc(currentModel?.description || "Choose which Gemini model document AI uses by default.")
+      .addDropdown(dropdown => {
+        for (const model of this.plugin.getGeminiModels()) {
+          dropdown.addOption(model.id, `${model.displayName} - ${model.id}`);
+        }
+        dropdown.setValue(this.plugin.settings.geminiModel)
+          .onChange(async value => {
+            await this.plugin.setGeminiModel(value);
+            this.display();
+          });
+      })
+      .addButton(button => button
+        .setButtonText("Refresh available models")
+        .onClick(async () => {
+          await this.plugin.refreshGeminiModels();
+          this.display();
+        }));
+    let customModel = "";
+    new Setting(containerEl)
+      .setName("Custom Gemini model ID")
+      .setDesc("Use an account-specific, latest, preview, or experimental model ID returned by Google, such as gemini-flash-latest.")
       .addText(text => text
-        .setPlaceholder(DEFAULT_GEMINI_MODEL)
-        .setValue(this.plugin.settings.geminiModel)
-        .onChange(async value => {
-          this.plugin.settings.geminiModel = value.trim() || DEFAULT_GEMINI_MODEL;
-          await this.plugin.saveSettings();
+        .setPlaceholder("gemini-model-name")
+        .onChange(value => {
+          customModel = value.trim().replace(/^models\//, "");
+        }))
+      .addButton(button => button
+        .setButtonText("Use custom model")
+        .onClick(async () => {
+          if (!customModel) {
+            new Notice("Enter a Gemini model ID first.", 5000);
+            return;
+          }
+          await this.plugin.setGeminiModel(customModel);
+          this.display();
         }));
 
     new Setting(containerEl).setName("Google Drive library").setHeading();
@@ -1468,6 +1582,14 @@ export default class GoogleAiHubPlugin extends Plugin {
             body: JSON.stringify(body)
           });
           return response.json;
+        },
+        get: async (url, apiKey) => {
+          const response = await requestUrl({
+            url,
+            method: "GET",
+            headers: { "x-goog-api-key": apiKey }
+          });
+          return response.json;
         }
       },
       () => resolveGeminiKey(
@@ -1542,6 +1664,11 @@ export default class GoogleAiHubPlugin extends Plugin {
       name: "Publish active note to Google Docs",
       checkCallback: checking => this.publishActiveNote(checking)
     });
+    this.addCommand({
+      id: "choose-gemini-model",
+      name: "AI: Choose Gemini model",
+      callback: () => void this.chooseGeminiModel()
+    });
     for (const action of ["summarize", "shorten", "lengthen", "elaborate"] as const) {
       this.addCommand({
         id: `ai-${action}-selection-or-note`,
@@ -1551,6 +1678,11 @@ export default class GoogleAiHubPlugin extends Plugin {
     }
 
     this.registerEvent(this.app.workspace.on("editor-menu", (menu, editor, view) => {
+      menu.addSeparator();
+      menu.addItem(item => item
+        .setTitle(`AI model: ${this.currentGeminiModelLabel()}`)
+        .setIcon("settings-2")
+        .onClick(() => void this.chooseGeminiModel()));
       menu.addSeparator();
       for (const action of ["summarize", "shorten", "lengthen", "elaborate"] as const) {
         menu.addItem(item => item
@@ -1575,6 +1707,11 @@ export default class GoogleAiHubPlugin extends Plugin {
         .setIcon("notebook-tabs")
         .onClick(() => void this.prepareItemForService(item, "notebooklm")));
       if (item instanceof TFile && item.extension === "gdoc") {
+        menu.addSeparator();
+        menu.addItem(menuItem => menuItem
+          .setTitle(`AI model: ${this.currentGeminiModelLabel()}`)
+          .setIcon("settings-2")
+          .onClick(() => void this.chooseGeminiModel()));
         menu.addSeparator();
         for (const action of ["summarize", "shorten", "lengthen", "elaborate"] as const) {
           menu.addItem(menuItem => menuItem
@@ -2731,6 +2868,11 @@ export default class GoogleAiHubPlugin extends Plugin {
     aiButton.addEventListener("click", event => {
       event.preventDefault();
       const menu = new Menu();
+      menu.addItem(item => item
+        .setTitle(`Model: ${this.currentGeminiModelLabel()}`)
+        .setIcon("settings-2")
+        .onClick(() => void this.chooseGeminiModel()));
+      menu.addSeparator();
       for (const action of ["summarize", "shorten", "lengthen", "elaborate"] as const) {
         menu.addItem(item => item
           .setTitle(this.aiActionLabel(action))
@@ -2827,18 +2969,23 @@ export default class GoogleAiHubPlugin extends Plugin {
       : action.charAt(0).toUpperCase() + action.slice(1);
   }
 
-  private async runAiWritingAction(action: AiWritingAction, target: AiDocumentTarget): Promise<void> {
+  private async runAiWritingAction(
+    action: AiWritingAction,
+    target: AiDocumentTarget,
+    model = this.settings.geminiModel
+  ): Promise<void> {
     const original = target.markdown;
     const revisionHash = sourceHash(await target.readRevision());
     let generated: AiResult | null = null;
-    new Notice(`${this.aiActionLabel(action)} with Gemini...`, 4000);
+    new Notice(`${this.aiActionLabel(action)} with ${this.currentGeminiModelLabel(model)}...`, 5000);
 
     while (true) {
       try {
         generated = await this.geminiAi.generate({
           action,
           title: target.title,
-          markdown: original
+          markdown: original,
+          model
         });
       } catch (error) {
         new Notice(`AI action failed: ${this.errorMessage(error)} The document was not changed.`, 12000);
@@ -2851,7 +2998,8 @@ export default class GoogleAiHubPlugin extends Plugin {
         action,
         original,
         generated.markdown,
-        canWrite
+        canWrite,
+        generated.model
       ).openAndWait();
       if (!choice) return;
       if (choice === "regenerate") continue;
@@ -2999,6 +3147,7 @@ export default class GoogleAiHubPlugin extends Plugin {
       googleDocsFolder: saved?.googleDocsFolder || DEFAULT_SETTINGS.googleDocsFolder,
       autoSyncGoogleDocs: saved?.autoSyncGoogleDocs ?? DEFAULT_SETTINGS.autoSyncGoogleDocs,
       geminiModel: saved?.geminiModel || DEFAULT_SETTINGS.geminiModel,
+      geminiKnownModels: Array.isArray(saved?.geminiKnownModels) ? saved.geminiKnownModels : [],
       googleDocShortcuts: saved?.googleDocShortcuts || {},
       noteMirrors: saved?.noteMirrors || {},
       folderMirrors: saved?.folderMirrors || {}
@@ -3009,18 +3158,66 @@ export default class GoogleAiHubPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
+  getGeminiModels(): GeminiModelInfo[] {
+    return mergeGeminiModels(this.settings.geminiKnownModels, [this.settings.geminiModel]);
+  }
+
+  currentGeminiModelLabel(modelId = this.settings.geminiModel): string {
+    return this.getGeminiModels().find(model => model.id === modelId)?.displayName || modelId;
+  }
+
+  async setGeminiModel(value: string): Promise<void> {
+    const modelId = normalizeGeminiModelId(value) || DEFAULT_GEMINI_MODEL;
+    this.settings.geminiModel = modelId;
+    if (!this.getGeminiModels().some(model => model.id === modelId)) {
+      this.settings.geminiKnownModels.push({
+        id: modelId,
+        displayName: modelId,
+        description: "Custom or account-specific Gemini model."
+      });
+    }
+    await this.saveSettings();
+    new Notice(`Google AI Hub will use ${this.currentGeminiModelLabel(modelId)}.`, 6000);
+  }
+
+  async chooseGeminiModel(): Promise<GeminiModelInfo | null> {
+    const model = await new GeminiModelPickerModal(
+      this.app,
+      this.getGeminiModels(),
+      this.settings.geminiModel
+    ).openAndWait();
+    if (model) await this.setGeminiModel(model.id);
+    return model;
+  }
+
+  async refreshGeminiModels(): Promise<GeminiModelInfo[]> {
+    new Notice("Checking models available to this Gemini API key...", 5000);
+    try {
+      const models = await this.geminiAi.listModels();
+      this.settings.geminiKnownModels = models;
+      await this.saveSettings();
+      new Notice(`Found ${models.length} Gemini text-generation models.`, 7000);
+      return models;
+    } catch (error) {
+      new Notice(`Could not refresh Gemini models: ${this.errorMessage(error)}`, 10000);
+      return this.getGeminiModels();
+    }
+  }
+
   async generateForSource(
     action: AiWritingAction,
     source: AiDocumentSource,
     instruction?: string,
-    conversation?: Array<{ role: "user" | "model"; text: string }>
+    conversation?: Array<{ role: "user" | "model"; text: string }>,
+    model = this.settings.geminiModel
   ): Promise<AiResult> {
     return this.geminiAi.generate({
       action,
       title: source.title,
       markdown: source.markdown,
       instruction,
-      conversation
+      conversation,
+      model
     });
   }
 
@@ -3042,7 +3239,14 @@ export default class GoogleAiHubPlugin extends Plugin {
         new Notice(`AI request failed: ${this.errorMessage(error)} The source was not changed.`, 11000);
         return;
       }
-      const choice = await new AiResultModal(this.app, action, source.markdown, result.markdown, false).openAndWait();
+      const choice = await new AiResultModal(
+        this.app,
+        action,
+        source.markdown,
+        result.markdown,
+        false,
+        result.model
+      ).openAndWait();
       if (choice === "regenerate") continue;
       if (choice === "copy") {
         await navigator.clipboard.writeText(result.markdown);

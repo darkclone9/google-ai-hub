@@ -9,6 +9,7 @@ Google AI Hub brings editable Google Docs tabs, Gemini document tools, grounded 
 - Edit a Google Doc tab directly inside an Obsidian Canvas card with headings, lists, emphasis, links, quotes, and code formatting.
 - Create, rename, reorder, nest, outdent, and delete native Google Docs tabs. Every open card for the document refreshes its tab strip immediately while keeping its own active tab and draft.
 - Summarize, shorten, lengthen, or elaborate a selection or whole document through Gemini with an Original/Result review before anything is changed.
+- Switch between quality, balanced, and fast Gemini models; discover every compatible model available to your API key or enter a custom model ID.
 - Use the same AI workflow in Markdown notes, Canvas Google Doc tabs, and standalone `.gdoc` shortcuts.
 - Research the active source in AI Hub with a summary, briefing report, grounded chat, and NotebookLM Studio launchers.
 - Index Google Drive documents as lightweight `.gdoc` shortcuts without duplicating their contents in the vault.
@@ -54,9 +55,12 @@ The plugin requests Google Docs edit access, Drive read access for indexing/expo
 1. Create a Gemini API key in Google AI Studio.
 2. Open **Settings > Google AI Hub > Gemini document AI**.
 3. Paste the key into **Gemini API key**.
-4. Leave the model at `gemini-3.5-flash` or enter another model available to your account.
+4. Under **Default Gemini model**, choose a preset or select **Refresh available models** to load every text-generation model available to your API key.
+5. For stronger long-form writing, try **Gemini 3.1 Pro Preview**. For faster everyday edits, use **Gemini 3.5 Flash**. Preview models may have different pricing, quotas, and retirement schedules.
 
-The key is stored through Obsidian Secret Storage. It is never written to `data.json` or logged. Developers may instead set `GEMINI_API_KEY`; Secret Storage takes precedence when both exist. See Google's [Gemini API key guide](https://ai.google.dev/gemini-api/docs/api-key) and [model reference](https://ai.google.dev/gemini-api/docs/models).
+The selected model can also be changed from **AI: Choose Gemini model** in the command palette, the Markdown editor AI menu, the Canvas **AI** menu, or the model selector at the top of AI Hub. A custom model ID can be entered in Settings for account-specific, preview, experimental, or `latest` aliases. Google AI Hub shows the model used in each result preview.
+
+The key is stored through Obsidian Secret Storage. It is never written to `data.json` or logged. Developers may instead set `GEMINI_API_KEY`; Secret Storage takes precedence when both exist. See Google's [Gemini API key guide](https://ai.google.dev/gemini-api/docs/api-key), [model reference](https://ai.google.dev/gemini-api/docs/models), and [deprecation schedule](https://ai.google.dev/gemini-api/docs/deprecations).
 
 ## Supported sources
 
@@ -129,6 +133,10 @@ Confirm that the Google Docs API is enabled and reconnect. The Canvas editor ret
 
 Re-enter the key in Obsidian Secret Storage, verify that the configured model is available to the key, and check Gemini quota or billing. The source is not modified on failure.
 
+### Results are weak or the model is unavailable
+
+Open **Settings > Google AI Hub > Default Gemini model**, choose **Refresh available models**, and try a Pro model for more demanding writing. You can also run **AI: Choose Gemini model** from the command palette without opening Settings. If a preview model disappears, select another discovered model; previews can have shorter availability windows.
+
 ### NotebookLM did not add or focus the source
 
 Open the intended notebook inside the embedded NotebookLM view and run the action again. The prepared source is also copied by the legacy source workflow when automatic insertion is unavailable.
@@ -147,6 +155,7 @@ The source changed while Gemini was responding. Copy the result or regenerate it
 - `Google AI Hub: AI: Shorten selection or note`
 - `Google AI Hub: AI: Lengthen selection or note`
 - `Google AI Hub: AI: Elaborate selection or note`
+- `Google AI Hub: AI: Choose Gemini model`
 - `Google AI Hub: Use active note in Gemini`
 - `Google AI Hub: Use active note in NotebookLM`
 - `Google AI Hub: Choose a vault source for Gemini`

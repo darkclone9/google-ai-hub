@@ -1,6 +1,42 @@
 export const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 export const MAX_AI_SOURCE_LENGTH = 200_000;
 
+export interface GeminiModelInfo {
+  id: string;
+  displayName: string;
+  description: string;
+  inputTokenLimit?: number;
+  outputTokenLimit?: number;
+  recommended?: boolean;
+}
+
+export const RECOMMENDED_GEMINI_MODELS: GeminiModelInfo[] = [
+  {
+    id: "gemini-3.1-pro-preview",
+    displayName: "Gemini 3.1 Pro Preview",
+    description: "Best available writing quality and deeper reasoning; preview pricing and rate limits may apply.",
+    recommended: true
+  },
+  {
+    id: "gemini-3.5-flash",
+    displayName: "Gemini 3.5 Flash",
+    description: "Balanced stable model for everyday editing, summaries, and chat.",
+    recommended: true
+  },
+  {
+    id: "gemini-2.5-pro",
+    displayName: "Gemini 2.5 Pro",
+    description: "Stable reasoning model that can produce stronger long-form results at higher cost and latency.",
+    recommended: true
+  },
+  {
+    id: "gemini-3.1-flash-lite",
+    displayName: "Gemini 3.1 Flash-Lite",
+    description: "Fast, lower-cost model for straightforward transformations.",
+    recommended: true
+  }
+];
+
 export type AiAction = "summarize" | "shorten" | "lengthen" | "elaborate" | "briefing" | "chat";
 export type AiWritingAction = AiAction;
 
@@ -25,16 +61,19 @@ export interface AiGenerateRequest {
   markdown: string;
   instruction?: string;
   conversation?: Array<{ role: "user" | "model"; text: string }>;
+  model?: string;
 }
 
 export interface AiResult {
   action: AiWritingAction;
   markdown: string;
   sourceHash: string;
+  model: string;
 }
 
 export interface GeminiTransport {
   post(url: string, apiKey: string, body: Record<string, unknown>): Promise<unknown>;
+  get?(url: string, apiKey: string): Promise<unknown>;
 }
 
 const ACTION_INSTRUCTIONS: Record<Exclude<AiWritingAction, "chat">, string> = {
@@ -66,6 +105,62 @@ export function cleanGeminiMarkdown(value: string): string {
   const trimmed = value.trim();
   const fenced = /^```(?:markdown|md)?\s*\n([\s\S]*?)\n```$/i.exec(trimmed);
   return (fenced?.[1] || trimmed).trim();
+}
+
+export function normalizeGeminiModelId(value: string): string {
+  return value.trim().replace(/^models\//, "");
+}
+
+export function mergeGeminiModels(
+  discovered: GeminiModelInfo[],
+  customIds: string[] = []
+): GeminiModelInfo[] {
+  const merged = new Map<string, GeminiModelInfo>();
+  for (const model of RECOMMENDED_GEMINI_MODELS) merged.set(model.id, model);
+  for (const model of discovered) {
+    const id = normalizeGeminiModelId(model.id);
+    if (!id) continue;
+    merged.set(id, { ...merged.get(id), ...model, id });
+  }
+  for (const value of customIds) {
+    const id = normalizeGeminiModelId(value);
+    if (id && !merged.has(id)) {
+      merged.set(id, { id, displayName: id, description: "Custom or account-specific Gemini model." });
+    }
+  }
+  const recommendedOrder = new Map(RECOMMENDED_GEMINI_MODELS.map((model, index) => [model.id, index]));
+  return Array.from(merged.values()).sort((left, right) => {
+    const leftOrder = recommendedOrder.get(left.id);
+    const rightOrder = recommendedOrder.get(right.id);
+    if (leftOrder !== undefined || rightOrder !== undefined) {
+      return (leftOrder ?? Number.MAX_SAFE_INTEGER) - (rightOrder ?? Number.MAX_SAFE_INTEGER);
+    }
+    return left.displayName.localeCompare(right.displayName);
+  });
+}
+
+export function parseGeminiModelList(payload: unknown): GeminiModelInfo[] {
+  const response = payload as {
+    models?: Array<{
+      name?: string;
+      displayName?: string;
+      description?: string;
+      inputTokenLimit?: number;
+      outputTokenLimit?: number;
+      supportedGenerationMethods?: string[];
+    }>;
+  };
+  return (response.models || [])
+    .filter(model => model.supportedGenerationMethods
+      ?.some(method => method.toLowerCase() === "generatecontent"))
+    .map(model => ({
+      id: normalizeGeminiModelId(model.name || ""),
+      displayName: model.displayName?.trim() || normalizeGeminiModelId(model.name || ""),
+      description: model.description?.trim() || "Available to this Gemini API key.",
+      inputTokenLimit: model.inputTokenLimit,
+      outputTokenLimit: model.outputTokenLimit
+    }))
+    .filter(model => Boolean(model.id));
 }
 
 export function buildAiPrompt(request: AiGenerateRequest): string {
@@ -130,6 +225,9 @@ function transportError(error: unknown): Error {
   if (failure.status === 429) {
     return new Error("Gemini quota was exceeded. Check the account quota or billing, then try again later.");
   }
+  if (failure.status === 404) {
+    return new Error("The selected Gemini model was not found or is not available to this API key. Refresh available models and choose another one.");
+  }
   if (typeof failure.status === "number" && failure.status >= 500) {
     return new Error("Gemini is temporarily unavailable. Try again later.");
   }
@@ -152,7 +250,7 @@ export class GeminiAiClient {
     }
     const apiKey = this.getApiKey();
     if (!apiKey) throw new Error("Add a Gemini API key in Google AI Hub settings or set GEMINI_API_KEY.");
-    const model = this.getModel().trim() || DEFAULT_GEMINI_MODEL;
+    const model = normalizeGeminiModelId(request.model || this.getModel()) || DEFAULT_GEMINI_MODEL;
     const contents = [
       ...(request.conversation || []).slice(-6).map(message => ({
         role: message.role,
@@ -179,7 +277,23 @@ export class GeminiAiClient {
     return {
       action: request.action,
       markdown: cleanGeminiMarkdown(responseText(payload)),
-      sourceHash: sourceHash(request.markdown)
+      sourceHash: sourceHash(request.markdown),
+      model
     };
+  }
+
+  async listModels(): Promise<GeminiModelInfo[]> {
+    const apiKey = this.getApiKey();
+    if (!apiKey) throw new Error("Add a Gemini API key before refreshing available models.");
+    if (!this.transport.get) throw new Error("This Gemini connection cannot list models.");
+    try {
+      const payload = await this.transport.get(
+        "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000",
+        apiKey
+      );
+      return parseGeminiModelList(payload);
+    } catch (error) {
+      throw transportError(error);
+    }
   }
 }
