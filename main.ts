@@ -50,6 +50,7 @@ import {
 } from "./gemini-ai";
 import { GoogleDocTabSyncRegistry, type GoogleDocTabChange } from "./tab-sync";
 import { migrateNoteMirrorPath, shouldAutoPublishNewNote } from "./auto-publish";
+import { chooseGoogleDocTabPlacement } from "./tab-placement";
 import {
   CanvasRepairAttemptRegistry,
   GOOGLE_DOC_TAB_DRAG_MIME,
@@ -2724,16 +2725,16 @@ export default class GoogleAiHubPlugin extends Plugin {
           }
 
           const markdown = await this.app.vault.cachedRead(note);
-          setSaveState("Creating child tab…", "saving");
-          const childIndex = tabs.filter(tab => tab.parentTabId === sourceTab.id).length;
+          const placement = chooseGoogleDocTabPlacement(tabs, sourceTab);
+          setSaveState(`Creating ${placement.relationship} tab…`, "saving");
           createdTabId = await this.driveBridge.addGoogleDocTab(
             documentId,
             note.basename,
-            sourceTab.id,
+            placement.parentTabId,
             "",
-            childIndex
+            placement.index
           );
-          if (!createdTabId) throw new Error("Google Docs did not return the new child tab ID.");
+          if (!createdTabId) throw new Error("Google Docs did not return the new tab ID.");
           if (markdown.trim()) {
             await this.driveBridge.updateGoogleDocTabContent(
               documentId,
@@ -2755,7 +2756,9 @@ export default class GoogleAiHubPlugin extends Plugin {
           this.scheduleCanvasGoogleDocRefresh();
           await this.tabSync.notify({ documentId, kind: "created", tabId: createdTabId });
           await renderDocument(true);
-          new Notice(`Created ${note.basename} under ${sourceTab.title} and opened its Google Doc interface.`, 8000);
+          new Notice(placement.limitedByDepth
+            ? `Created ${note.basename} beside ${sourceTab.title} because Google Docs cannot nest tabs any deeper.`
+            : `Created ${note.basename} under ${sourceTab.title} and opened its Google Doc interface.`, 9000);
         } catch (error) {
           if (createdTabId && !cardRecreated) {
             try {
