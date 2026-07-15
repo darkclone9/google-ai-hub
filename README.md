@@ -102,6 +102,7 @@ Add a `.gdoc` shortcut to Canvas to get a native Obsidian editor instead of an u
 - Use **Paragraph** for headings, quotes, and code; **B/I/S** for emphasis; **•/1.** for lists; and **Link** or `Ctrl+K` for links.
 - Use **Save** or `Ctrl+S` to save immediately; otherwise changes autosave after a short pause.
 - Use **+** for a root tab, double-click a tab to rename it, and right-click for move, nesting, outdent, child, and delete actions.
+- Drag a card connector and choose **Add Google Doc tab** to create the tab from that exact source card. The connected node is recreated as a real `.gdoc` file card so its tabs, formatting controls, and editable document interface load immediately.
 - Drag a tab into an empty Canvas location to create a new card pinned to that existing Google Docs tab.
 - Hold `Shift` while dragging a tab to create a brand-new sibling tab above or below it; the placement dialog appears at the drop location.
 - Creating or changing a tab broadcasts a document-scoped refresh to every open card. Other cards retain their active tab, caret, selection, and unsaved draft.

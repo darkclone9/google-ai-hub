@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   CanvasRepairAttemptRegistry,
   canvasPositionClientPoint,
+  chooseCanvasConnectorCandidate,
   parseGoogleDocTabDrag,
+  recreateCanvasNodeAsGoogleDocTabCard,
   repairMalformedGoogleDocTabCards,
   repairMalformedGoogleDocTabNode,
   serializeGoogleDocTabDrag
@@ -22,6 +24,20 @@ describe("Canvas Google Doc tab drag payload", () => {
 
   it("converts DOM client coordinates to the Canvas API's x/y shape", () => {
     expect(canvasPositionClientPoint({ clientX: 640, clientY: 480 })).toEqual({ x: 640, y: 480 });
+  });
+
+  it("prefers the active connector source over a stale selected card", () => {
+    expect(chooseCanvasConnectorCandidate([
+      { value: "wrong-global-card", isConnectorSource: false, isSelected: true },
+      { value: "actual-connector-card", isConnectorSource: true, isSelected: false }
+    ])).toBe("actual-connector-card");
+  });
+
+  it("does not guess when several global cards are selected", () => {
+    expect(chooseCanvasConnectorCandidate([
+      { value: "first", isConnectorSource: false, isSelected: true },
+      { value: "second", isConnectorSource: false, isSelected: true }
+    ])).toBeNull();
   });
 
   it("repairs empty text nodes that were intended to be Google Doc tab cards", () => {
@@ -82,6 +98,46 @@ describe("Canvas Google Doc tab drag payload", () => {
     expect(setData.mock.calls[1][0]).toEqual({
       nodes: [expect.objectContaining({ id: "broken", type: "file", width: 300, height: 260 }), { id: "source", type: "file" }],
       edges: [{ id: "edge-1", fromNode: "source", toNode: "broken" }]
+    });
+  });
+
+  it("recreates a connector placeholder as a real file card and restores its edge", async () => {
+    const setData = vi.fn();
+    const data = {
+      nodes: [
+        { id: "source", type: "file", file: "Google Docs/source.gdoc" },
+        { id: "placeholder", type: "text", text: "", x: 20, y: 30, width: 250, height: 60 }
+      ],
+      edges: [{ id: "edge-1", fromNode: "source", toNode: "placeholder" }]
+    };
+
+    await expect(recreateCanvasNodeAsGoogleDocTabCard(
+      { setData },
+      data,
+      "placeholder",
+      "Google Docs/source.gdoc",
+      "#google-ai-hub-tab=child-1"
+    )).resolves.toBe(true);
+    expect(setData).toHaveBeenCalledTimes(2);
+    expect(setData.mock.calls[0][0]).toEqual({
+      nodes: [{ id: "source", type: "file", file: "Google Docs/source.gdoc" }],
+      edges: []
+    });
+    expect(setData.mock.calls[1][0]).toEqual({
+      nodes: [
+        { id: "source", type: "file", file: "Google Docs/source.gdoc" },
+        {
+          id: "placeholder",
+          type: "file",
+          file: "Google Docs/source.gdoc",
+          subpath: "#google-ai-hub-tab=child-1",
+          x: 20,
+          y: 30,
+          width: 300,
+          height: 260
+        }
+      ],
+      edges: [{ id: "edge-1", fromNode: "source", toNode: "placeholder" }]
     });
   });
 });

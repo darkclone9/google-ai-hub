@@ -32,6 +32,12 @@ export interface CanvasDataSetter {
   setData(data: RepairableCanvasData): void | Promise<void>;
 }
 
+export interface CanvasConnectorCandidate<T> {
+  value: T;
+  isConnectorSource: boolean;
+  isSelected: boolean;
+}
+
 const GOOGLE_DOC_TAB_SUBPATH_PREFIX = "#google-ai-hub-tab=";
 
 export class CanvasRepairAttemptRegistry {
@@ -46,6 +52,57 @@ export class CanvasRepairAttemptRegistry {
 
 export function canvasPositionClientPoint(point: CanvasClientPoint): CanvasPosition {
   return { x: point.clientX, y: point.clientY };
+}
+
+export function chooseCanvasConnectorCandidate<T>(
+  candidates: readonly CanvasConnectorCandidate<T>[]
+): T | null {
+  const connectorSources = candidates.filter(candidate => candidate.isConnectorSource);
+  if (connectorSources.length === 1) return connectorSources[0].value;
+  if (connectorSources.length > 1) {
+    const selectedConnectorSources = connectorSources.filter(candidate => candidate.isSelected);
+    return selectedConnectorSources.length === 1 ? selectedConnectorSources[0].value : null;
+  }
+
+  const selected = candidates.filter(candidate => candidate.isSelected);
+  return selected.length === 1 ? selected[0].value : null;
+}
+
+export async function recreateCanvasNodeAsGoogleDocTabCard(
+  canvas: CanvasDataSetter,
+  data: RepairableCanvasData,
+  nodeId: string,
+  file: string,
+  subpath: string
+): Promise<boolean> {
+  const sourceNode = data.nodes.find(node => node.id === nodeId);
+  if (!sourceNode || !file || !subpath.startsWith(GOOGLE_DOC_TAB_SUBPATH_PREFIX)) return false;
+
+  const replacement: CanvasDataNode = {
+    ...sourceNode,
+    type: "file",
+    file,
+    subpath,
+    width: Math.max(300, typeof sourceNode.width === "number" ? sourceNode.width : 400),
+    height: Math.max(260, typeof sourceNode.height === "number" ? sourceNode.height : 400)
+  };
+  delete replacement.text;
+  delete replacement.url;
+
+  const intermediate: RepairableCanvasData = {
+    ...data,
+    nodes: data.nodes.filter(node => node.id !== nodeId),
+    edges: data.edges.filter(edge =>
+      String(edge.fromNode || "") !== nodeId
+      && String(edge.toNode || "") !== nodeId
+    )
+  };
+  await Promise.resolve(canvas.setData(intermediate));
+  await Promise.resolve(canvas.setData({
+    ...data,
+    nodes: data.nodes.map(node => node.id === nodeId ? replacement : node)
+  }));
+  return true;
 }
 
 export function repairMalformedGoogleDocTabNode(node: CanvasDataNode): CanvasDataNode {

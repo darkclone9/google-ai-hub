@@ -54,7 +54,9 @@ import {
   CanvasRepairAttemptRegistry,
   GOOGLE_DOC_TAB_DRAG_MIME,
   canvasPositionClientPoint,
+  chooseCanvasConnectorCandidate,
   parseGoogleDocTabDrag,
+  recreateCanvasNodeAsGoogleDocTabCard,
   repairMalformedGoogleDocTabCards,
   serializeGoogleDocTabDrag
 } from "./canvas-tab-drag";
@@ -1892,19 +1894,25 @@ export default class GoogleAiHubPlugin extends Plugin {
       }
       if (!menu || !addNoteButton || menu.querySelector(".google-ai-hub-gdoc-connector-add")) continue;
 
-      const action = Array.from(this.canvasGoogleDocConnectorActions.values()).find(candidate => {
+      const candidates = Array.from(this.canvasGoogleDocConnectorActions.values()).map(candidate => {
+        let isConnectorSource = false;
+        let isSelected = false;
         try {
-          const selected = candidate.canvas.getSelectionData().nodes.some(node => node.id === candidate.node.id);
-          if (selected) return true;
           const connectorSources = candidate.canvas.edgeFrom?.data?.keys();
-          if (!connectorSources) return false;
-          return Array.from(connectorSources).some(source =>
+          isConnectorSource = connectorSources ? Array.from(connectorSources).some(source =>
             (typeof source === "string" ? source : source.id) === candidate.node.id
-          );
+          ) : false;
         } catch {
-          return candidate.node.nodeEl?.classList.contains("is-selected") || false;
+          isConnectorSource = false;
         }
+        try {
+          isSelected = candidate.canvas.getSelectionData().nodes.some(node => node.id === candidate.node.id);
+        } catch {
+          isSelected = candidate.node.nodeEl?.classList.contains("is-selected") || false;
+        }
+        return { value: candidate, isConnectorSource, isSelected };
       });
+      const action = chooseCanvasConnectorCandidate(candidates);
       if (!action) continue;
 
       const addTabButton = addCardButton.cloneNode(true) as HTMLElement;
@@ -2606,7 +2614,11 @@ export default class GoogleAiHubPlugin extends Plugin {
       }
 
       const canvas = canvasContext.canvas;
-      const sourceData = canvasContext.node.getData();
+      const source = sourceCanvasFile();
+      if (!source) {
+        new Notice("Could not find the selected Google Doc shortcut for the connected card.", 8000);
+        return;
+      }
       const beforeData = JSON.parse(JSON.stringify(canvas.getData())) as CanvasRuntimeData;
       const beforeNodeIds = new Set(beforeData.nodes.map(node => node.id));
 
@@ -2646,24 +2658,18 @@ export default class GoogleAiHubPlugin extends Plugin {
         if (!createdTabId) throw new Error("Google Docs did not return the new tab ID.");
 
         const currentData = canvas.getData();
-        const nextNodes = currentData.nodes.map(node => {
-          if (node.id !== placeholderNode.id) return node;
-          const fileNode: Record<string, unknown> & { id: string; type: string } = {
-            ...node,
-            type: "file",
-            file: sourceData.file,
-            subpath: googleDocTabSubpath(createdTabId)
-          };
-          delete fileNode.text;
-          delete fileNode.url;
-          return fileNode;
-        });
-        if (!nextNodes.some(node => node.id === placeholderNode.id && node.type === "file")) {
+        const recreated = await recreateCanvasNodeAsGoogleDocTabCard(
+          canvas,
+          currentData,
+          placeholderNode.id,
+          source.file.path,
+          googleDocTabSubpath(createdTabId)
+        );
+        if (!recreated) {
           throw new Error("Obsidian could not convert the connected card to a Google Doc tab card.");
         }
-
-        await Promise.resolve(canvas.setData({ ...currentData, nodes: nextNodes }));
         canvas.requestSave();
+        this.scheduleCanvasGoogleDocRefresh();
         await this.tabSync.notify({ documentId, kind: "created", tabId: createdTabId });
         new Notice(`Created ${editor.title} ${editor.placement} ${sourceTab.title} in the connected card.`, 8000);
       } catch (error) {
